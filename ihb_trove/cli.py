@@ -11,8 +11,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_folder", type=Path)
     parser.add_argument("output_folder", type=Path)
-    parser.add_argument("--tasks", type=int, default=1)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--tasks",
+        type=int,
+        default=None,
+        help="DataTrove shards (default: up to 4 per worker; always capped by JSONL file count)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Concurrent DataTrove workers (default: CPU quota and file count, capped at 32)",
+    )
     parser.add_argument("--language", default="vi")
     parser.add_argument("--language-backend", choices=("langdetect", "ft176", "glotlid"), default="langdetect")
     parser.add_argument("--page-marker", action="append", dest="page_markers")

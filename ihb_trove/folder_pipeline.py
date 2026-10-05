@@ -2,12 +2,17 @@
 
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, BinaryIO
+
+import orjson
+from tqdm import tqdm
 
 from .pipelines import (
     build_book_pipeline,
@@ -19,19 +24,120 @@ from .pipelines import (
 _UID = "_ihb_uid"
 _SOURCE = "ihb_source_relpath"
 _LINE = "ihb_source_line"
+_AUTO_WORKER_LIMIT = 32
+_PREP_WORKER_LIMIT = 16
 
 
-def _records(folder: Path) -> Iterator[dict[str, Any]]:
+def _records(folder: Path, *, progress: str | None = None) -> Iterator[dict[str, Any]]:
     if not folder.exists():
         return
-    for path in sorted(folder.rglob("*.jsonl")):
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    value = json.loads(line)
+    description = progress or f"Read {folder.name or folder}"
+    with tqdm(desc=description, unit="doc", mininterval=1.0, disable=None) as bar:
+        for path in sorted(folder.rglob("*.jsonl")):
+            with path.open("rb") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        value = orjson.loads(line)
+                    except orjson.JSONDecodeError:
+                        value = json.loads(line)
                     if not isinstance(value, dict):
                         raise ValueError(f"Unexpected non-object record in {path}")
+                    bar.update(1)
                     yield value
+
+
+def _available_cpu_count() -> int:
+    """Respect CPU affinity and cgroup quotas when selecting automatic workers."""
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 1
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if quota != "max" and int(period) > 0:
+            available = min(available, max(1, int(int(quota) / int(period))))
+    except (OSError, ValueError):
+        pass
+    return max(1, available)
+
+
+def _resolve_parallelism(file_count: int, tasks: int | None, workers: int | None) -> tuple[int, int]:
+    cpu_count = _available_cpu_count()
+    if workers is None:
+        workers = min(_AUTO_WORKER_LIMIT, cpu_count, file_count)
+    if tasks is None:
+        # A few tasks per worker balances uneven file sizes without creating
+        # thousands of mostly empty DataTrove shards on large hosts.
+        tasks = min(file_count, workers * 4)
+    if tasks < 1 or workers < 1:
+        raise ValueError("tasks and workers must be positive")
+    tasks = min(tasks, file_count)
+    return tasks, min(workers, tasks)
+
+
+def _prepare_one_file(
+    input_root: Path,
+    staged: Path,
+    invalid_root: Path,
+    relative_name: str,
+) -> tuple[int, int]:
+    relative = Path(relative_name)
+    destination = staged / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    invalid_path = invalid_root / relative
+    total = valid = 0
+    invalid_handle: BinaryIO | None = None
+    try:
+        with (input_root / relative).open("rb") as src, destination.open("wb") as dst:
+            for line_number, line in enumerate(src, start=1):
+                if not line.strip():
+                    continue
+                total += 1
+                try:
+                    record = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        record = {
+                            "text": line.decode("utf-8").rstrip("\r\n"),
+                            "id": f"{relative_name}#{line_number}",
+                        }
+                        reason = "invalid_json"
+                    else:
+                        reason = None
+                else:
+                    reason = None
+                if reason is None and not isinstance(record, dict):
+                    record = {
+                        "text": line.decode("utf-8").rstrip("\r\n"),
+                        "id": f"{relative_name}#{line_number}",
+                    }
+                    reason = "invalid_record"
+                elif reason is None and (not isinstance(record.get("text"), str) or not record["text"].strip()):
+                    reason = "missing_text"
+                metadata = record.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {"source_metadata": metadata}
+                metadata = dict(metadata)
+                metadata.update({_UID: _uid(relative, line_number), _SOURCE: relative_name, _LINE: line_number})
+                record["metadata"] = metadata
+                record.setdefault("id", f"{relative_name}#{line_number}")
+                if reason:
+                    metadata["filter_reason"] = reason
+                    if invalid_handle is None:
+                        invalid_path.parent.mkdir(parents=True, exist_ok=True)
+                        invalid_handle = invalid_path.open("wb")
+                    invalid_handle.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
+                else:
+                    dst.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
+                    valid += 1
+    finally:
+        if invalid_handle is not None:
+            invalid_handle.close()
+    return total, valid
 
 
 def _has_records(folder: Path) -> bool:
@@ -50,7 +156,7 @@ class _OutputRouter:
         self.root = root
         self.allowed = {path.as_posix() for path in relative_paths}
         self.max_open = max_open
-        self.open_files: OrderedDict[Path, TextIO] = OrderedDict()
+        self.open_files: OrderedDict[Path, BinaryIO] = OrderedDict()
         self.survive = 0
         self.eliminated = 0
         for relative in relative_paths:
@@ -77,9 +183,9 @@ class _OutputRouter:
             if len(self.open_files) >= self.max_open:
                 _, old = self.open_files.popitem(last=False)
                 old.close()
-            handle = path.open("a", encoding="utf-8")
+            handle = path.open("ab")
         self.open_files[path] = handle
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
         if category == "survive":
             self.survive += 1
         else:
@@ -91,42 +197,36 @@ class _OutputRouter:
         self.open_files.clear()
 
 
-def _prepare_input(input_root: Path, staged: Path, router: _OutputRouter) -> tuple[int, int]:
+def _prepare_input(
+    input_root: Path,
+    staged: Path,
+    invalid_root: Path,
+    router: _OutputRouter,
+    preparation_workers: int,
+) -> tuple[int, int]:
     total = valid = 0
-    for relative_name in sorted(router.allowed):
-        relative = Path(relative_name)
-        destination = staged / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with (input_root / relative).open("r", encoding="utf-8") as src, destination.open("w", encoding="utf-8") as dst:
-            for line_number, line in enumerate(src, start=1):
-                if not line.strip():
-                    continue
-                total += 1
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    record = {"text": line.rstrip("\n"), "id": f"{relative_name}#{line_number}"}
-                    reason = "invalid_json"
-                else:
-                    reason = None
-                    if not isinstance(record, dict):
-                        record = {"text": line.rstrip("\n"), "id": f"{relative_name}#{line_number}"}
-                        reason = "invalid_record"
-                    elif not isinstance(record.get("text"), str) or not record["text"].strip():
-                        reason = "missing_text"
-                metadata = record.get("metadata", {})
-                if not isinstance(metadata, dict):
-                    metadata = {"source_metadata": metadata}
-                metadata = dict(metadata)
-                metadata.update({_UID: _uid(relative, line_number), _SOURCE: relative_name, _LINE: line_number})
-                record["metadata"] = metadata
-                record.setdefault("id", f"{relative_name}#{line_number}")
-                if reason:
-                    metadata["filter_reason"] = reason
-                    router.write(record, "eliminated", "input_validation")
-                else:
-                    dst.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    valid += 1
+    names = sorted(router.allowed)
+    pool_size = min(preparation_workers, len(names))
+    with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="ihb-jsonl") as pool:
+        futures = [
+            pool.submit(_prepare_one_file, input_root, staged, invalid_root, relative_name)
+            for relative_name in names
+        ]
+        with tqdm(
+            total=len(futures),
+            desc="Validate & stage JSONL",
+            unit="file",
+            mininterval=1.0,
+            disable=None,
+        ) as bar:
+            for future in as_completed(futures):
+                file_total, file_valid = future.result()
+                total += file_total
+                valid += file_valid
+                bar.update(1)
+                bar.set_postfix(records=total, valid=valid, refresh=False)
+    for record in _records(invalid_root, progress="Route invalid input"):
+        router.write(record, "eliminated", "input_validation")
     return total, valid
 
 
@@ -148,8 +248,8 @@ def run_folder_pipeline(
     input_folder: str | Path,
     output_folder: str | Path,
     *,
-    tasks: int = 1,
-    workers: int = 1,
+    tasks: int | None = None,
+    workers: int | None = None,
     language: str = "vi",
     language_backend: str = "langdetect",
     page_markers: tuple[str, ...] = ("---",),
@@ -164,8 +264,10 @@ def run_folder_pipeline(
     A nonempty output directory is refused to prevent accidental mixed runs.
     """
     source, output = Path(input_folder).resolve(), Path(output_folder).resolve()
-    if not source.is_dir() or tasks < 1 or workers < 1:
-        raise ValueError("input_folder must be a directory; tasks/workers must be positive")
+    if not source.is_dir():
+        raise ValueError("input_folder must be a directory")
+    if (tasks is not None and tasks < 1) or (workers is not None and workers < 1):
+        raise ValueError("tasks/workers must be positive when specified")
     if source == output or source in output.parents or output in source.parents:
         raise ValueError("input and output directories must not overlap")
     if output.exists() and any(output.iterdir()):
@@ -173,14 +275,30 @@ def run_folder_pipeline(
     paths = sorted(path.relative_to(source) for path in source.rglob("*.jsonl") if path.is_file())
     if not paths:
         raise ValueError(f"No JSONL files under {source}")
+    tasks, workers = _resolve_parallelism(len(paths), tasks, workers)
+    preparation_workers = min(_PREP_WORKER_LIMIT, workers, len(paths))
     output.mkdir(parents=True, exist_ok=True)
     router = _OutputRouter(output, paths)
-    summary: dict[str, Any] = {"input_files": len(paths), "stages": {}}
+    summary: dict[str, Any] = {
+        "input_files": len(paths),
+        "parallelism": {
+            "tasks": tasks,
+            "workers": workers,
+            "preparation_workers": preparation_workers,
+        },
+        "stages": {},
+    }
     try:
         with tempfile.TemporaryDirectory(prefix="ihb-trove-", dir=output.parent) as tmp:
             work = Path(tmp)
             source_staged, stages = work / "input", work / "stages"
-            total, valid = _prepare_input(source, source_staged, router)
+            total, valid = _prepare_input(
+                source,
+                source_staged,
+                work / "invalid_input",
+                router,
+                preparation_workers,
+            )
             summary.update(input_records=total, validated_records=valid)
             if valid:
                 book = build_book_pipeline(

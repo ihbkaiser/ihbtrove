@@ -1,6 +1,7 @@
 """Composable LocalPipelineExecutor jobs around unmodified DataTrove blocks."""
 
 from pathlib import Path
+import sys
 
 from datatrove.data import Document
 from datatrove.executor.local import LocalPipelineExecutor
@@ -41,7 +42,7 @@ def _writer(path: Path) -> JsonlWriter:
 
 
 def _reader(path: Path, glob_pattern: str = "*.jsonl") -> JsonlReader:
-    return JsonlReader(str(path), glob_pattern=glob_pattern)
+    return JsonlReader(str(path), glob_pattern=glob_pattern, file_progress=sys.stderr.isatty())
 
 
 def _exact_text(doc: Document) -> str:

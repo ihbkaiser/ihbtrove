@@ -26,7 +26,7 @@ def test_recursive_mirror_invalid_records_and_global_duplicate(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    summary = run_folder_pipeline(source, output, tasks=2, workers=1)
+    summary = run_folder_pipeline(source, output, tasks=2, workers=2)
     assert summary["input_files"] == 2
     assert summary["input_records"] == 4
     assert summary["survive"] == 1

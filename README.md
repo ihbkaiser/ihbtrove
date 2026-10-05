@@ -25,8 +25,10 @@ Requires Python 3.11+. The package declares the Vietnamese tokenizer and JSONL d
 ```bash
 python -m venv .venv
 .venv/bin/python -m pip install -e .
-.venv/bin/ihb-trove /path/to/input_jsonl_folder /path/to/new_output_folder --tasks 4 --workers 4
+.venv/bin/ihb-trove /path/to/input_jsonl_folder /path/to/new_output_folder
 ```
+
+By default, the CLI detects the available CPU quota, uses up to 32 workers and creates up to four DataTrove shards per worker, capped by the number of JSONL files. Task count is always capped by the file count because this runner shards its reader by file. Input validation/staging reads up to 16 files concurrently. Pass `--tasks` and `--workers` to override these defaults. Set `--workers 1` for a serial baseline. Progress bars report staged files, DataTrove reader file shards, and records being routed; bars are disabled automatically when output is not an interactive terminal.
 
 To confirm both import names resolve to this checkout:
 
