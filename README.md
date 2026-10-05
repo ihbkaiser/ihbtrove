@@ -1,17 +1,37 @@
 # IHB-Trove
 
-Deterministic structural repair **before** conventional DataTrove filtering and deduplication for ebook, OCR, and HTML-to-text corpora. The extension uses DataTrove `PipelineStep`, `BaseFilter`, `JsonlReader`/`JsonlWriter`, `LocalPipelineExecutor`, ExactDedup, SentenceDedup, and MinHash. It does not modify DataTrove core and runs on CPU without LLMs or embeddings.
+Deterministic structural repair **before** conventional DataTrove filtering and deduplication for ebook, OCR, and HTML-to-text corpora. The extension uses DataTrove `PipelineStep`, `BaseFilter`, `JsonlReader`/`JsonlWriter`, `LocalPipelineExecutor`, ExactDedup, SentenceDedup, and MinHash. It runs on CPU without LLMs or embeddings.
 
 ![Comparison of DataTrove and IHB-Trove pipelines](docs/datatrove-vs-ihb-trove.png)
 
+## Before and after on supplied books
+
+![IHB-Trove repairs a page break and image placeholder](docs/ihb-trove-before-after-demo.png)
+
+The left panels illustrate a **DataTrove reader/writer pass-through** without a repair step; DataTrove has no default filtering pipeline that guarantees a particular output. The right panels show structural changes verified on the supplied ebook JSONL files. The image shortens surrounding text for legibility. It does not claim to verify the factual content or recover missing OCR text. A severely corrupted third book remains excluded at the default 30% repair limit.
+
+## Portable bundled DataTrove
+
+This repository includes the `datatrove/` Python package and assets from the user's original `datatrove.zip` (SHA-256 `e16e9fcd796d56a8edcfebe2333073a0fae16039a03bdc7a7fce224055e63fac`). The archive is a modified DataTrove snapshot, **not** a stock PyPI wheel; its bytecode and notebook checkpoints are excluded. A single `pip install -e .` installs both `ihb_trove` and `datatrove` imports, with no separate `pip install datatrove` required. Keep this environment separate from an existing DataTrove installation because the two distributions expose the same import name.
+
+The supplied snapshot pointed FT176 to `/workspace/storage-shared/nlp/maitn4/code/data-processing/utils/lid.176.bin` and the public suffix list to `/workspace/storage-shared/nlp/maitn4/code/data-processing/utils/public_suffix_list.dat`. These locations remain preferred if the files exist. Override them with `IHB_TROVE_FT176_MODEL` and `IHB_TROVE_PUBLIC_SUFFIX_LIST`. Otherwise FT176 falls back to the official fastText download URL/cache, and URLFilter uses tldextract's bundled suffix snapshot without a network fetch. **Model weights are not included.** The default `langdetect` gate runs offline and does not require FT176. For FT176 install `pip install -e '.[ft176]'`; for URLFilter install `pip install -e '.[url-filter]'`.
+
+The DataTrove sources are redistributed under [Apache License 2.0](DATATROVE_LICENSE). IHB-specific changes to the bundled sources are marked in comments in `datatrove/utils/lid.py`, `datatrove/pipeline/filters/url_filter.py`, and `datatrove/pipeline/filters/language_filter.py`. The original DataTrove project is [huggingface/datatrove](https://github.com/huggingface/datatrove).
+
 ## Folder in → `survive/` and `eliminated/` out
 
-Requires Python 3.11+ and DataTrove 0.10.1. The package declares the Vietnamese tokenizer and JSONL dependencies directly; its default `langdetect` language gate works offline without a model download.
+Requires Python 3.11+. The package declares the Vietnamese tokenizer and JSONL dependencies directly; its default `langdetect` language gate works offline without a model download.
 
 ```bash
 python -m venv .venv
 .venv/bin/python -m pip install -e .
 .venv/bin/ihb-trove /path/to/input_jsonl_folder /path/to/new_output_folder --tasks 4 --workers 4
+```
+
+To confirm both import names resolve to this checkout:
+
+```bash
+.venv/bin/python -c "import datatrove, ihb_trove; print(datatrove.__file__, ihb_trove.__file__)"
 ```
 
 The script scans `*.jsonl` **recursively**, processes all documents together for global deduplication, and mirrors each input file's relative path under both outputs. Each source has a corresponding JSONL file in each output, possibly empty. Every input record goes to exactly one side. Invalid JSON and records without text go to `eliminated/` with a reason; filtering and whole-document dedup removals also go there. SentenceDedup edits a surviving document's text without routing its original copy to `eliminated/`.

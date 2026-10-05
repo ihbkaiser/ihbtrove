@@ -4,11 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ihb-trove"
-version = "0.3.0"
+version = "0.4.0"
 description = "Deterministic structural repair extension for Hugging Face DataTrove"
 requires-python = ">=3.11"
 dependencies = [
-    "datatrove>=0.10.1,<0.11",
+    "dill>=0.3.0",
+    "fsspec>=2023.12.2",
+    "huggingface-hub>=1.6.0",
+    "humanize",
+    "loguru>=0.7.0",
+    "multiprocess",
+    "numpy>=2.0.0",
+    "tqdm",
+    "fasteners",
+    "xxhash<4",
     "rapidfuzz>=3.0",
     "langdetect>=1.0.9",
     "orjson>=3.0",
@@ -24,9 +33,24 @@ ihb-trove = "ihb_trove.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+ft176 = ["fasttext-numpy2-wheel"]
+url-filter = ["tldextract", "pyahocorasick"]
 
 [tool.setuptools.packages.find]
-include = ["ihb_trove*"]
+include = ["ihb_trove*", "datatrove*"]
+
+[tool.setuptools.package-data]
+datatrove = [
+    "assets/*",
+    "pipeline/inference/*.md",
+    "tools/fast_mh3/Cargo.toml",
+    "tools/fast_mh3/Cargo.lock",
+    "tools/fast_mh3/README.md",
+    "tools/fast_mh3/src/*.rs",
+]
+
+[tool.setuptools.data-files]
+"share/doc/ihb-trove" = ["DATATROVE_LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
