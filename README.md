@@ -30,6 +30,12 @@ python -m venv .venv
 
 By default, the CLI detects the available CPU quota, uses up to 32 workers and creates up to four DataTrove shards per worker, capped by the number of JSONL files. Task count is always capped by the file count because this runner shards its reader by file. Input validation/staging reads up to 16 files concurrently. Pass `--tasks` and `--workers` to override these defaults. Set `--workers 1` for a serial baseline. Progress bars report staged files, DataTrove reader file shards, and records being routed; bars are disabled automatically when output is not an interactive terminal.
 
+The run writes a live orchestration log to `OUTPUT/logs/run.log`; DataTrove executor/task logs remain under `OUTPUT/logs/datatrove/` after completion. Follow the live log in another terminal with:
+
+```bash
+tail -f /path/to/new_output_folder/logs/run.log
+```
+
 To confirm both import names resolve to this checkout:
 
 ```bash
@@ -51,7 +57,7 @@ new_output_folder/
   summary.json
 ```
 
-Every eliminated record carries `metadata.filter_reason` and `metadata.ihb_exclusion_stage`; records retain their source file and one-based source line in metadata. The CLI refuses a nonempty output folder and rejects overlapping input/output directories. Intermediate DataTrove signatures and logs live in a temporary work directory and are removed after a successful run.
+Every eliminated record carries `metadata.filter_reason` and `metadata.ihb_exclusion_stage`; records retain their source file and one-based source line in metadata. The CLI refuses a nonempty output folder and rejects overlapping input/output directories. Intermediate DataTrove signatures live in a temporary work directory and are removed after a successful run; persistent run and executor logs stay under `output/logs/`.
 
 ```bash
 # If the corpus is mixed media and real image references should be retained:

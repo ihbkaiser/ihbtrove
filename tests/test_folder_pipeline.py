@@ -42,3 +42,10 @@ def test_recursive_mirror_invalid_records_and_global_duplicate(tmp_path: Path) -
     assert set(reasons) == {"invalid_json", "missing_text", "exact_dedup"}
     assert _read(output / "survive" / "one.jsonl") or _read(output / "survive" / "nested" / "two.jsonl")
     assert (output / "summary.json").is_file()
+    assert Path(summary["log_file"]).is_file()
+    run_log = Path(summary["log_file"]).read_text(encoding="utf-8")
+    assert "IHB-Trove run started" in run_log
+    assert "START stage: repair and quality filters" in run_log
+    assert "Run summary:" in run_log
+    assert "IHB-Trove run finished" in run_log
+    assert list((output / "logs" / "datatrove").rglob("task_*.log"))

@@ -62,12 +62,14 @@ def build_book_pipeline(
     remove_image_placeholders: bool = True,
     repair_long_line_loops: bool = True,
     repair_max_removed_fraction: float = 0.30,
+    logging_root: str | Path | None = None,
     gopher_dup_n_grams: tuple[tuple[int, float], ...] = (
         (5, 0.20), (6, 0.19), (7, 0.18), (8, 0.17), (9, 0.16), (10, 0.15),
     ),
 ) -> LocalPipelineExecutor:
     """Run structural repair before language and traditional text quality gates."""
     root = Path(output_root)
+    logs = Path(logging_root) if logging_root is not None else root / "logs"
     return LocalPipelineExecutor(
         pipeline=[
             _reader(Path(source), glob_pattern),
@@ -105,7 +107,7 @@ def build_book_pipeline(
         ],
         tasks=tasks,
         workers=workers,
-        logging_dir=str(root / "logs" / "book"),
+        logging_dir=str(logs / "book"),
     )
 
 
@@ -116,9 +118,11 @@ def build_exact_dedup_pipeline(
     tasks: int = 1,
     workers: int = 1,
     depends: LocalPipelineExecutor | None = None,
+    logging_root: str | Path | None = None,
 ) -> LocalPipelineExecutor:
     """Signature → global exact matching → filter, with stable reader sharding."""
     root = Path(output_root)
+    logs = Path(logging_root) if logging_root is not None else root / "logs"
     config = ExactDedupConfig(content_getter=_exact_text, hash_config=HashConfig(hash_fc="sha1"))
     signatures, duplicates = root / "work" / "exact" / "signatures", root / "work" / "exact" / "duplicates"
     signature_job = LocalPipelineExecutor(
@@ -126,21 +130,21 @@ def build_exact_dedup_pipeline(
         tasks=tasks,
         workers=workers,
         depends=depends,
-        logging_dir=str(root / "logs" / "exact_signature"),
+        logging_dir=str(logs / "exact_signature"),
     )
     find_job = LocalPipelineExecutor(
         pipeline=[ExactFindDedups(str(signatures), str(duplicates), config)],
         tasks=1,
         workers=1,
         depends=signature_job,
-        logging_dir=str(root / "logs" / "exact_find"),
+        logging_dir=str(logs / "exact_find"),
     )
     return LocalPipelineExecutor(
         pipeline=[_reader(Path(source)), ExactDedupFilter(str(duplicates), config), _writer(root / "exact")],
         tasks=tasks,
         workers=workers,
         depends=find_job,
-        logging_dir=str(root / "logs" / "exact_filter"),
+        logging_dir=str(logs / "exact_filter"),
     )
 
 
@@ -152,9 +156,11 @@ def build_sentence_dedup_pipeline(
     workers: int = 1,
     language: str = "vi",
     depends: LocalPipelineExecutor | None = None,
+    logging_root: str | Path | None = None,
 ) -> LocalPipelineExecutor:
     """Use DataTrove sentence dedup, preserving short repeated book sections."""
     root = Path(output_root)
+    logs = Path(logging_root) if logging_root is not None else root / "logs"
     config = SentDedupConfig(n_sentences=3, min_words_to_remove_span=25, hash_config=HashConfig(hash_fc="sha1"))
     signatures, duplicates = root / "work" / "sentence" / "signatures", root / "work" / "sentence" / "duplicates"
     signature_job = LocalPipelineExecutor(
@@ -162,14 +168,14 @@ def build_sentence_dedup_pipeline(
         tasks=tasks,
         workers=workers,
         depends=depends,
-        logging_dir=str(root / "logs" / "sentence_signature"),
+        logging_dir=str(logs / "sentence_signature"),
     )
     find_job = LocalPipelineExecutor(
         pipeline=[SentenceFindDedups(str(signatures), str(duplicates), config=config)],
         tasks=1,
         workers=1,
         depends=signature_job,
-        logging_dir=str(root / "logs" / "sentence_find"),
+        logging_dir=str(logs / "sentence_find"),
     )
     return LocalPipelineExecutor(
         pipeline=[
@@ -180,7 +186,7 @@ def build_sentence_dedup_pipeline(
         tasks=tasks,
         workers=workers,
         depends=find_job,
-        logging_dir=str(root / "logs" / "sentence_filter"),
+        logging_dir=str(logs / "sentence_filter"),
     )
 
 
@@ -193,9 +199,11 @@ def build_minhash_pipeline(
     language: str = "vi",
     config: MinhashConfig | None = None,
     depends: LocalPipelineExecutor | None = None,
+    logging_root: str | Path | None = None,
 ) -> LocalPipelineExecutor:
     """DataTrove MinHash signature → bucket match → cluster → filter."""
     root = Path(output_root)
+    logs = Path(logging_root) if logging_root is not None else root / "logs"
     config = config or MinhashConfig(hash_config=HashConfig(hash_fc="sha1"))
     work = root / "work" / "minhash"
     signatures, pairs, removals = work / "signatures", work / "pairs", work / "removals"
@@ -204,26 +212,26 @@ def build_minhash_pipeline(
         tasks=tasks,
         workers=workers,
         depends=depends,
-        logging_dir=str(root / "logs" / "minhash_signature"),
+        logging_dir=str(logs / "minhash_signature"),
     )
     buckets_job = LocalPipelineExecutor(
         pipeline=[MinhashDedupBuckets(str(signatures), str(pairs), config=config)],
         tasks=config.num_buckets,
         workers=min(workers, config.num_buckets),
         depends=signature_job,
-        logging_dir=str(root / "logs" / "minhash_buckets"),
+        logging_dir=str(logs / "minhash_buckets"),
     )
     cluster_job = LocalPipelineExecutor(
         pipeline=[MinhashDedupCluster(str(pairs), str(removals), config=config)],
         tasks=1,
         workers=1,
         depends=buckets_job,
-        logging_dir=str(root / "logs" / "minhash_cluster"),
+        logging_dir=str(logs / "minhash_cluster"),
     )
     return LocalPipelineExecutor(
         pipeline=[_reader(Path(source)), MinhashDedupFilter(str(removals)), _writer(root / "minhash")],
         tasks=tasks,
         workers=workers,
         depends=cluster_job,
-        logging_dir=str(root / "logs" / "minhash_filter"),
+        logging_dir=str(logs / "minhash_filter"),
     )
