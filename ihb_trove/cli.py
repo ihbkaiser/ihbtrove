@@ -23,6 +23,11 @@ def main() -> None:
         default=None,
         help="Concurrent DataTrove workers (default: CPU quota and file count, capped at 32)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from completed stage checkpoints in the existing output folder",
+    )
     parser.add_argument("--language", default="vi")
     parser.add_argument("--language-backend", choices=("langdetect", "ft176", "glotlid"), default="langdetect")
     parser.add_argument("--page-marker", action="append", dest="page_markers")
@@ -41,6 +46,7 @@ def main() -> None:
         max_repair_fraction=args.max_repair_fraction,
         remove_image_placeholders=not args.keep_image_placeholders,
         repair_long_line_loops=not args.skip_long_line_loops,
+        resume=args.resume,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

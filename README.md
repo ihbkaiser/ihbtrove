@@ -28,6 +28,14 @@ python -m venv .venv
 .venv/bin/ihb-trove /path/to/input_jsonl_folder /path/to/new_output_folder
 ```
 
+If a run is interrupted, resume it with the same input, output, and pipeline options:
+
+```bash
+.venv/bin/ihb-trove /path/to/input_jsonl_folder /path/to/new_output_folder --resume
+```
+
+The runner checkpoints completed stages under `OUTPUT/.ihb_trove_cache/`. The cache is retained after interruption and removed after a successful run. A resumed run reuses completed stages and reruns only the unfinished stage; if interrupted during final routing, it rebuilds `survive/` and `eliminated/` from cached stage outputs. Input content and pipeline options must match the checkpoint. Resume re-reads the input to verify its content fingerprint. Legacy interrupted runs that only have an `ihb-trove-*` temporary directory cannot be resumed by this feature.
+
 By default, the CLI detects the available CPU quota, uses up to 32 workers and creates up to four DataTrove shards per worker, capped by the number of JSONL files. Task count is always capped by the file count because this runner shards its reader by file. Input validation/staging reads up to 16 files concurrently. Pass `--tasks` and `--workers` to override these defaults. Set `--workers 1` for a serial baseline. Progress bars report staged files, DataTrove reader file shards, and records being routed; bars are disabled automatically when output is not an interactive terminal.
 
 The run writes a live orchestration log to `OUTPUT/logs/run.log`; DataTrove executor/task logs remain under `OUTPUT/logs/datatrove/` after completion. Follow the live log in another terminal with:
@@ -54,6 +62,7 @@ new_output_folder/
   survive/collection/book_b.jsonl
   eliminated/book_a.jsonl
   eliminated/collection/book_b.jsonl
+  .ihb_trove_cache/              # retained only while a run is incomplete
   summary.json
 ```
 
