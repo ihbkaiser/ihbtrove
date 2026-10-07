@@ -10,4 +10,10 @@ from .minhash import (
     MinhashDedupFilter,
     MinhashDedupSignature,
 )
-from .sentence_dedup import SentDedupConfig, SentenceDedupFilter, SentenceDedupSignature, SentenceFindDedups
+from .sentence_dedup import (
+    SENTENCE_SIGNATURE_FORMAT_VERSION,
+    SentDedupConfig,
+    SentenceDedupFilter,
+    SentenceDedupSignature,
+    SentenceFindDedups,
+)

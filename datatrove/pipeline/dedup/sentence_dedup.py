@@ -38,6 +38,8 @@ from datatrove.utils.typeshelper import ExtensionHelperSD, Languages, StatHints
 from ...utils.word_tokenizers import load_word_tokenizer
 from ..writers.disk_base import DiskWriter
 
+SENTENCE_SIGNATURE_FORMAT_VERSION = 2
+
 
 @dataclass
 class SentDedupConfig:
@@ -101,7 +103,7 @@ class SentenceDedupSignature(PipelineStep):
     def save_hashes(self, rank: int, signatures):
         # explicitly define little endianness
         signatures = np.array(
-            signatures, dtype=[("hash", self.config.hash_config.np_descr), ("doc", "<u4"), ("sent", "<u2")]
+            signatures, dtype=[("hash", self.config.hash_config.np_descr), ("doc", "<u4"), ("sent", "<u4")]
         )
         signatures.sort(axis=0)
 
@@ -173,7 +175,7 @@ def read_sigs(
     index_file: bool = False,
     lines_to_buffer: int = 5,
 ) -> Generator[HashSig, None, None]:
-    line_format = f"{config.hash_config.struct_format}IH" if not index_file else config.hash_config.struct_format
+    line_format = f"{config.hash_config.struct_format}II" if not index_file else config.hash_config.struct_format
     file_stem = Path(file.path).name.removesuffix(ExtensionHelperSD.stage_1_signature)
     last = None
     with file as f:
@@ -188,10 +190,11 @@ def read_sigs(
 
 
 class SentenceFindDedups(PipelineStep):
-    """SentenceDedup: Second pipeline step
+    """SentenceDedup: Second pipeline step.
 
-        SentenceFindDedups runs on a single worker. It reads all the signatures from the previous step and loads them
-        in a priority queue to check for duplicates. If a duplicate is found its document id and sentence id are saved.
+        Each hash-range task reads its signature partition and merges its
+        sorted files to check for duplicates. Duplicate document and sentence
+        IDs are saved for the filter stage.
 
     Args:
         data_folder: data folder where signatures are saved
@@ -267,7 +270,7 @@ class SentenceFindDedups(PipelineStep):
 
             output_mg = self.output_folder.get_output_file_manager(mode="wb")
 
-            packer = struct.Struct("<IH")
+            packer = struct.Struct("<II")
 
             last: HashSig | None = None
             while pq:
@@ -324,7 +327,7 @@ class SentenceDedupFilter(PipelineStep):
     def read_duplicates(self, file: BinaryIO) -> np.ndarray:
         """Helper function to read duplicates from a binary file storing (doc_id, sent_id) pairs as created by the second stage."""
         return read_np_from_file(
-            file, dtype=np.dtype([("doc", "<u4"), ("sent", "<u2")]), is_local_file=self.data_folder.is_local()
+            file, dtype=np.dtype([("doc", "<u4"), ("sent", "<u4")]), is_local_file=self.data_folder.is_local()
         )
 
     def remove_dup_sentences(self, doc: Document, du_lines: np.ndarray) -> tuple[str, str]:
@@ -394,7 +397,7 @@ class SentenceDedupFilter(PipelineStep):
 
         logger.info(f"Loading duplicate indexes from {len(files)} results files.")
 
-        all_dups = np.array([], dtype=[("doc", "<u4"), ("sent", "<u2")])
+        all_dups = np.array([], dtype=[("doc", "<u4"), ("sent", "<u4")])
         if files:
             with ThreadPoolExecutor() as pool:
                 all_dups = np.concatenate(

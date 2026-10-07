@@ -6,6 +6,7 @@ import sys
 from datatrove.data import Document
 from datatrove.executor.local import LocalPipelineExecutor
 from datatrove.pipeline.dedup import (
+    SENTENCE_SIGNATURE_FORMAT_VERSION,
     ExactDedupConfig,
     ExactDedupFilter,
     ExactDedupSignature,

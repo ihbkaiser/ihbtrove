@@ -24,6 +24,7 @@ from .pipelines import (
     BOOK_GOPHER_FILTER_POLICY_VERSION,
     BOOK_QUALITY_POLICY_VERSION,
     DEDUP_TOKENIZER_POLICY_VERSION,
+    SENTENCE_SIGNATURE_FORMAT_VERSION,
     build_book_pipeline,
     build_exact_dedup_pipeline,
     build_minhash_pipeline,
@@ -134,6 +135,30 @@ def _clear_path(path: Path) -> None:
         shutil.rmtree(path)
     elif path.exists():
         path.unlink()
+
+
+def _clear_datatrove_logs(output: Path, stage: str) -> None:
+    """Clear DataTrove completion markers before rebuilding an interrupted stage."""
+    log_names = {
+        "book_quality": ("book",),
+        "exact": ("exact_signature", "exact_find", "exact_filter"),
+        "sentence": ("sentence_signature", "sentence_find", "sentence_filter"),
+        "minhash": ("minhash_signature", "minhash_buckets", "minhash_cluster", "minhash_filter"),
+    }
+    for name in log_names[stage]:
+        _clear_path(output / "logs" / "datatrove" / name)
+
+
+def _invalidate_sentence_dedup_checkpoint(cache_root: Path, state: dict[str, Any]) -> None:
+    """Keep completed preprocessing/exact work and discard old-format sentence outputs."""
+    sentence_index = _STAGES.index("sentence")
+    state["completed_stages"] = state["completed_stages"][:sentence_index]
+    stats = state.setdefault("stats", {})
+    stage_stats = stats.setdefault("stages", {})
+    stage_stats.pop("sentence", None)
+    stage_stats.pop("minhash", None)
+    stats.pop("summary", None)
+    (cache_root.parent / "summary.json").unlink(missing_ok=True)
 
 
 @contextmanager
@@ -705,12 +730,23 @@ def _run_folder_pipeline_impl(
         "book_gopher_filter_policy_version": BOOK_GOPHER_FILTER_POLICY_VERSION,
         "book_quality_policy_version": BOOK_QUALITY_POLICY_VERSION,
         "dedup_tokenizer_policy_version": DEDUP_TOKENIZER_POLICY_VERSION,
+        "sentence_signature_format_version": SENTENCE_SIGNATURE_FORMAT_VERSION,
         "repair_version": REPAIR_VERSION,
     }
     # Older checkpoints used DataTrove's single-worker finder. Keep that exact
     # executor layout when resuming them; new runs record the optimized setting.
     if saved_config is not None and "dedup_finder_workers" not in saved_config and dedup_finder_workers == 1:
         config.pop("dedup_finder_workers")
+    if saved_config is not None and "sentence_signature_format_version" not in saved_config:
+        legacy_config = dict(config)
+        legacy_config.pop("sentence_signature_format_version")
+        if saved_config != legacy_config:
+            raise ValueError("Pipeline options differ from the checkpoint; resume with the original options")
+        _invalidate_sentence_dedup_checkpoint(cache_root, state)
+        _info(
+            run_log,
+            "Checkpoint migration: invalidated SentenceDedup and downstream stages for the wider sentence ID format",
+        )
     if len(sources) == 1:
         saved_source = state.get("source_root")
         if saved_source is not None and saved_source != str(sources[0]):
@@ -730,7 +766,11 @@ def _run_folder_pipeline_impl(
             raise ValueError("Input folder list differs from the checkpoint")
         state["source_roots"] = source_spec
         state.pop("source_root", None)
-    if saved_config is not None and saved_config != config:
+    if (
+        saved_config is not None
+        and "sentence_signature_format_version" in saved_config
+        and saved_config != config
+    ):
         raise ValueError("Pipeline options differ from the checkpoint; resume with the original options")
     state["input_file_count"] = len(source_files)
     state["config"] = config
@@ -789,6 +829,7 @@ def _run_folder_pipeline_impl(
     filtered = stages / "filtered"
     if "book_quality" not in state["completed_stages"]:
         _clear_path(stages)
+        _clear_datatrove_logs(output, "book_quality")
         if valid:
             with _timed_stage(run_log, "repair and quality filters"):
                 build_book_pipeline(
@@ -826,6 +867,7 @@ def _run_folder_pipeline_impl(
         else:
             _clear_path(current)
             _clear_path(stages / "work" / name)
+            _clear_datatrove_logs(output, name)
             if _has_records(previous):
                 kwargs: dict[str, Any] = {"tasks": tasks, "workers": workers}
                 if name != "exact":

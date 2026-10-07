@@ -213,12 +213,17 @@ def test_resume_reuses_completed_stages_and_checks_input_fingerprint(
     assert saved["config"]["book_gopher_filter_policy_version"] == "0.3.0"
     assert saved["config"]["book_quality_policy_version"] == "0.2.0"
     assert saved["config"]["dedup_tokenizer_policy_version"] == "0.1.0"
+    assert saved["config"]["sentence_signature_format_version"] == 2
     assert saved["config"]["repair_version"] == "0.4.0"
 
-    # A checkpoint from before the finder tuning had no finder worker option.
-    # It must continue with the original single-worker layout when resumed.
+    # Older checkpoints lack both the finder tuning and the wide sentence ID
+    # schema; resume keeps the single-worker layout and rebuilds downstream stages.
     saved["config"].pop("dedup_finder_workers")
+    saved["config"].pop("sentence_signature_format_version")
     checkpoint.write_text(json.dumps(saved), encoding="utf-8")
+    stale_completion = output / "logs" / "datatrove" / "sentence_signature" / "completions" / "00000"
+    stale_completion.parent.mkdir(parents=True, exist_ok=True)
+    stale_completion.touch()
 
     original_input = input_path.read_bytes()
     input_path.write_text(json.dumps({"id": "changed", "text": "Changed content."}) + "\n", encoding="utf-8")
@@ -233,6 +238,8 @@ def test_resume_reuses_completed_stages_and_checks_input_fingerprint(
     summary = run_folder_pipeline(source, output, tasks=1, workers=1, resume=True)
     assert summary["resumed_from_checkpoint"] is True
     assert calls == {"book": 1, "exact": 1, "sentence": 2, "minhash": 1}
+    assert not stale_completion.exists()
+    assert "Checkpoint migration" in Path(summary["log_file"]).read_text(encoding="utf-8")
     assert sum(len(_read(path)) for path in (output / "survive").rglob("*.jsonl")) == 1
     eliminated = [record for path in (output / "eliminated").rglob("*.jsonl") for record in _read(path)]
     assert len(eliminated) == 1
