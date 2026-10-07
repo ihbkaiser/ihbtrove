@@ -8,19 +8,19 @@ Deterministic structural repair **before** conventional DataTrove filtering and 
 
 ![IHB-Trove repairs a page break and image placeholder](docs/ihb-trove-before-after-demo.png)
 
-The left panels illustrate a **DataTrove reader/writer pass-through** without a repair step; DataTrove has no default filtering pipeline that guarantees a particular output. The right panels show structural changes verified on the supplied ebook JSONL files. The image shortens surrounding text for legibility. It does not claim to verify the factual content or recover missing OCR text. A severely corrupted third book remains excluded at the default 30% repair limit.
+The left panels illustrate a **DataTrove reader/writer pass-through** without a repair step; DataTrove has no default filtering pipeline that guarantees a particular output. The right panels show structural changes verified on supplied ebook JSONL files. The image shortens surrounding text for legibility. It does not claim to verify factual content or recover missing OCR text. The current default keeps documents regardless of how many characters repair removes and records those metrics for review.
 
 ## Portable bundled DataTrove
 
 This repository includes the `datatrove/` Python package and assets from the user's original `datatrove.zip` (SHA-256 `e16e9fcd796d56a8edcfebe2333073a0fae16039a03bdc7a7fce224055e63fac`). The archive is a modified DataTrove snapshot, **not** a stock PyPI wheel; its bytecode and notebook checkpoints are excluded. A single `pip install -e .` installs both `ihb_trove` and `datatrove` imports, with no separate `pip install datatrove` required. Keep this environment separate from an existing DataTrove installation because the two distributions expose the same import name.
 
-The supplied snapshot pointed FT176 to `/workspace/storage-shared/nlp/maitn4/code/data-processing/utils/lid.176.bin` and the public suffix list to `/workspace/storage-shared/nlp/maitn4/code/data-processing/utils/public_suffix_list.dat`. These locations remain preferred if the files exist. Override them with `IHB_TROVE_FT176_MODEL` and `IHB_TROVE_PUBLIC_SUFFIX_LIST`. Otherwise FT176 falls back to the official fastText download URL/cache, and URLFilter uses tldextract's bundled suffix snapshot without a network fetch. **Model weights are not included.** The default `langdetect` gate runs offline and does not require FT176. For FT176 install `pip install -e '.[ft176]'`; for URLFilter install `pip install -e '.[url-filter]'`.
+The supplied snapshot pointed FT176 to `/workspace/storage-shared/nlp/maitn4/code/data-processing/utils/lid.176.bin` and the public suffix list to `/workspace/storage-shared/nlp/maitn4/code/data-processing/utils/public_suffix_list.dat`. These locations remain preferred if the files exist. Override them with `IHB_TROVE_FT176_MODEL` and `IHB_TROVE_PUBLIC_SUFFIX_LIST`. Otherwise FT176 falls back to the official fastText download URL/cache, and URLFilter uses tldextract's bundled suffix snapshot without a network fetch. **Model weights are not included.** The default IHB-Trove path does not run a language detector. For FT176 install `pip install -e '.[ft176]'`; for URLFilter install `pip install -e '.[url-filter]'`.
 
-The DataTrove sources are redistributed under [Apache License 2.0](DATATROVE_LICENSE). IHB-specific changes to the bundled sources are marked in comments in `datatrove/utils/lid.py`, `datatrove/pipeline/filters/url_filter.py`, and `datatrove/pipeline/filters/language_filter.py`. The original DataTrove project is [huggingface/datatrove](https://github.com/huggingface/datatrove).
+The DataTrove sources are redistributed under [Apache License 2.0](DATATROVE_LICENSE). IHB-specific changes to bundled sources are marked in comments or visible in the diffs, including the optional no-tokenizer path in Gopher for mixed-language character-only checks. The original DataTrove project is [huggingface/datatrove](https://github.com/huggingface/datatrove).
 
 ## Folder in → `survive/` and `eliminated/` out
 
-Requires Python 3.11+. The package declares the Vietnamese tokenizer and JSONL dependencies directly; its default `langdetect` language gate works offline without a model download.
+Requires Python 3.11+. The default path keeps every language and uses an offline Unicode tokenizer for deduplication; it does not download language models.
 
 ```bash
 python -m venv .venv
@@ -72,22 +72,27 @@ Every eliminated record carries `metadata.filter_reason` and `metadata.ihb_exclu
 # If the corpus is mixed media and real image references should be retained:
 .venv/bin/ihb-trove INPUT OUTPUT --keep-image-placeholders
 
-# Exploratory rescue of a heavily corrupted OCR book; review before training:
-.venv/bin/ihb-trove INPUT OUTPUT --max-repair-fraction 0.40
-
 # Custom page marker in addition to form feed (repeat the option for multiple markers):
 .venv/bin/ihb-trove INPUT OUTPUT --page-marker='[PAGE]'
+
+# Optional: join visible hyphenated line breaks (review output for altered words/names):
+.venv/bin/ihb-trove INPUT OUTPUT --dehyphenate-line-breaks
+
+# Optional: use a DataTrove locale tokenizer for SentenceDedup/MinHash instead of UnicodeTokenizer:
+.venv/bin/ihb-trove INPUT OUTPUT --dedup-tokenizer-language en
 ```
 
-The default repair removal limit is **30%**. For this text-only corpus, Markdown/HTML image references and generated unavailable-image notes are removed by default. `--language` defaults to `vi`; `--language-backend langdetect` is deterministic and offline. `ft176` and `glotlid` use DataTrove's native `LanguageFilter` and require their models to be available. `--skip-long-line-loops` disables the conservative exact OCR word-loop repair.
+There is no language filter and no maximum repair-fraction gate: `RepairMetrics` records the edit counts and confidence for review, while the repaired document continues through the pipeline. Markdown/HTML image references and generated unavailable-image notes are removed by default. `--skip-long-line-loops` disables the conservative exact OCR word-loop repair. The Unicode normalization step expands common presentation ligatures, removes soft hyphens, trims line-end spaces, and caps blank-line runs at two; use `--max-consecutive-blank-lines` to change the cap. Visible-hyphen line joining is opt-in because it can alter legitimate words and names.
 
 ## Processing order
 
-1. `UnicodeNormalizer` → `ImagePlaceholderRepair` → `PageStructureRepair` → `LocalRepeatedSpanRepair` → `LongLineLoopRepair` → `RepairMetrics`.
-2. `RepairQualityFilter` → offline language filter (or DataTrove `LanguageFilter`) → `GopherRepetitionFilter` → `BookQualityFilter`.
+1. `UnicodeNormalizer` (Unicode/ligature normalization, soft-hyphen removal, whitespace cleanup; optional visible-hyphen joining) → `ImagePlaceholderRepair` → `PageStructureRepair` → `LocalRepeatedSpanRepair` → `LongLineLoopRepair` → `RepairMetrics`.
+2. `GopherRepetitionFilter` with only permissive, language-neutral duplicate-character checks → `BookQualityFilter` (empty text and extreme repeated long lines only).
 3. Separate DataTrove jobs: **ExactDedup → SentenceDedup → MinHash**. A disk-backed routing pass compares stage outputs by a stable source-record ID so every dropped document receives a reason, including whole-document dedup drops.
 
 `PageStructureRepair` recognizes `---`, form feed, and configured markers. It learns recurring edge lines with normalized signatures and RapidFuzz OCR clustering; stable numeric titles can be headers, while changing recipe numbers are preserved. Page numbers require a consistent offset, including contiguous offset changes. `LocalRepeatedSpanRepair` verifies rolling-hash hits on nearby long multiline spans. `LongLineLoopRepair` keeps one copy of a substantial word span repeated at least four times within a long line. Short repeated headings such as `Nguyên liệu` remain content. All repair counters, before/after lengths, removed fraction, confidence, and version are written to `document.metadata["repair"]`.
+
+The default keeps every language. Gopher's duplicate-line and duplicate-paragraph count checks and locale-sensitive word n-grams are disabled; duplicate-character checks are set to 50% so short headings and structured prose do not reject a whole document. `BookQualityFilter` has no default minimum word count or alphabetic fraction and rejects only empty text or extreme repetition of long lines. SentenceDedup and MinHash use `UnicodeTokenizer`, a deterministic offline tokenizer with Unicode letter/number runs and grapheme shingles for scripts commonly written without spaces. Grapheme shingles are a language-neutral approximation, not linguistic word segmentation. `--dedup-tokenizer-language` is an optional override for a known single-language corpus.
 
 ## Validation
 
@@ -95,6 +100,6 @@ The default repair removal limit is **30%**. For this text-only corpus, Markdown
 .venv/bin/python -m pytest -q
 ```
 
-On the three supplied JSONL books, the default gate produced **2 surviving and 1 eliminated** document. The eliminated power book had 32.7% of its characters removed during exact OCR repair and was marked `excessive_repair`. With an explicit 40% exploratory limit, all three documents survived through ExactDedup, SentenceDedup, and MinHash. The six Markdown image references and one generated image note in this pool were removed; none remains in the final text. These are corpus checks, not evidence that the remaining OCR prose or medical claims are correct.
+The sample fixes remain covered by repair fixtures: recurring page furniture, OCR variants, page numbers, page-boundary sentence joins, repeated OCR spans, and image placeholders. A document is no longer eliminated just because a large fraction was repaired; review `metadata.repair` for `removed_fraction` and `repair_confidence` if you need a separate human-review policy. These structural checks do not verify factual correctness or recover missing OCR text.
 
 The per-document repair steps hold a document in memory. For very large books, split the input into chapters or volumes with intact page markers. Global dedup quality cannot be estimated from only three different books. Existing table-of-contents and publisher back matter are intentionally left for a separate corpus policy.

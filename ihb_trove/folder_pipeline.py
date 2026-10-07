@@ -21,11 +21,15 @@ from tqdm import tqdm
 from datatrove.utils.logging import logger, setup_default_logger
 
 from .pipelines import (
+    BOOK_GOPHER_FILTER_POLICY_VERSION,
+    BOOK_QUALITY_POLICY_VERSION,
+    DEDUP_TOKENIZER_POLICY_VERSION,
     build_book_pipeline,
     build_exact_dedup_pipeline,
     build_minhash_pipeline,
     build_sentence_dedup_pipeline,
 )
+from .repair._common import REPAIR_VERSION
 
 _UID = "_ihb_uid"
 _SOURCE = "ihb_source_relpath"
@@ -463,12 +467,12 @@ def run_folder_pipeline(
     *,
     tasks: int | None = None,
     workers: int | None = None,
-    language: str = "vi",
-    language_backend: str = "langdetect",
+    dedup_tokenizer_language: str | None = None,
     page_markers: tuple[str, ...] = ("---",),
-    max_repair_fraction: float = 0.30,
     remove_image_placeholders: bool = True,
     repair_long_line_loops: bool = True,
+    dehyphenate_line_breaks: bool = False,
+    max_consecutive_blank_lines: int | None = 2,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Process recursive JSONL files globally and mirror each source under both outputs.
@@ -483,6 +487,8 @@ def run_folder_pipeline(
         raise ValueError("input_folder must be a directory")
     if (tasks is not None and tasks < 1) or (workers is not None and workers < 1):
         raise ValueError("tasks/workers must be positive when specified")
+    if max_consecutive_blank_lines is not None and max_consecutive_blank_lines < 0:
+        raise ValueError("max_consecutive_blank_lines must be nonnegative or None")
     if source == output or source in output.parents or output in source.parents:
         raise ValueError("input and output directories must not overlap")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -537,16 +543,17 @@ def run_folder_pipeline(
         _info(run_log, "Detailed live log: {}", log_path)
         _info(
             run_log,
-            "Requested options: tasks={} workers={} language={} language_backend={} page_markers={} "
-            "max_repair_fraction={} remove_image_placeholders={} repair_long_line_loops={}",
+            "Requested options: tasks={} workers={} dedup_tokenizer_language={} page_markers={} "
+            "remove_image_placeholders={} repair_long_line_loops={} "
+            "dehyphenate_line_breaks={} max_consecutive_blank_lines={}",
             tasks,
             workers,
-            language,
-            language_backend,
+            dedup_tokenizer_language,
             page_markers,
-            max_repair_fraction,
             remove_image_placeholders,
             repair_long_line_loops,
+            dehyphenate_line_breaks,
+            max_consecutive_blank_lines,
         )
         try:
             return _run_folder_pipeline_impl(
@@ -558,12 +565,12 @@ def run_folder_pipeline(
                 run_log=run_log,
                 tasks=tasks,
                 workers=workers,
-                language=language,
-                language_backend=language_backend,
+                dedup_tokenizer_language=dedup_tokenizer_language,
                 page_markers=page_markers,
-                max_repair_fraction=max_repair_fraction,
                 remove_image_placeholders=remove_image_placeholders,
                 repair_long_line_loops=repair_long_line_loops,
+                dehyphenate_line_breaks=dehyphenate_line_breaks,
+                max_consecutive_blank_lines=max_consecutive_blank_lines,
             )
         except Exception:
             _exception(run_log, "IHB-Trove run failed; checkpoint retained for --resume")
@@ -588,12 +595,12 @@ def _run_folder_pipeline_impl(
     run_log: logging.Logger,
     tasks: int | None,
     workers: int | None,
-    language: str,
-    language_backend: str,
+    dedup_tokenizer_language: str | None,
     page_markers: tuple[str, ...],
-    max_repair_fraction: float,
     remove_image_placeholders: bool,
     repair_long_line_loops: bool,
+    dehyphenate_line_breaks: bool,
+    max_consecutive_blank_lines: int | None,
 ) -> dict[str, Any]:
     _info(run_log, "Scanning recursively for JSONL files")
     discovery_started = time.perf_counter()
@@ -630,12 +637,16 @@ def _run_folder_pipeline_impl(
     config = {
         "tasks": tasks,
         "workers": workers,
-        "language": language,
-        "language_backend": language_backend,
+        "dedup_tokenizer_language": dedup_tokenizer_language,
         "page_markers": list(page_markers),
-        "max_repair_fraction": max_repair_fraction,
         "remove_image_placeholders": remove_image_placeholders,
         "repair_long_line_loops": repair_long_line_loops,
+        "dehyphenate_line_breaks": dehyphenate_line_breaks,
+        "max_consecutive_blank_lines": max_consecutive_blank_lines,
+        "book_gopher_filter_policy_version": BOOK_GOPHER_FILTER_POLICY_VERSION,
+        "book_quality_policy_version": BOOK_QUALITY_POLICY_VERSION,
+        "dedup_tokenizer_policy_version": DEDUP_TOKENIZER_POLICY_VERSION,
+        "repair_version": REPAIR_VERSION,
     }
     saved_source = state.get("source_root")
     if saved_source is not None and saved_source != str(source):
@@ -708,12 +719,11 @@ def _run_folder_pipeline_impl(
                     glob_pattern="**/*.jsonl",
                     tasks=tasks,
                     workers=workers,
-                    language=language,
-                    language_backend=language_backend,
                     page_markers=page_markers,
-                    repair_max_removed_fraction=max_repair_fraction,
                     remove_image_placeholders=remove_image_placeholders,
                     repair_long_line_loops=repair_long_line_loops,
+                    dehyphenate_line_breaks=dehyphenate_line_breaks,
+                    max_consecutive_blank_lines=max_consecutive_blank_lines,
                     logging_root=output / "logs" / "datatrove",
                 ).run()
         else:
@@ -741,7 +751,7 @@ def _run_folder_pipeline_impl(
             if _has_records(previous):
                 kwargs: dict[str, Any] = {"tasks": tasks, "workers": workers}
                 if name != "exact":
-                    kwargs["language"] = language
+                    kwargs["tokenizer_language"] = dedup_tokenizer_language
                 kwargs["logging_root"] = output / "logs" / "datatrove"
                 with _timed_stage(run_log, f"{name} dedup"):
                     builder(previous, stages, **kwargs).run()
@@ -772,7 +782,7 @@ def _run_folder_pipeline_impl(
         with _timed_stage(run_log, "route all exclusions and survivors"):
             for record in _records(invalid_root, progress="Route invalid input", run_log=run_log):
                 router.write(record, "eliminated", "input_validation")
-            for gate in ("repair", "language", "repetition", "book_quality"):
+            for gate in ("repetition", "book_quality"):
                 gate_count = 0
                 for record in _records(
                     stages / "quarantine" / gate,

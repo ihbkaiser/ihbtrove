@@ -23,9 +23,11 @@ def main() -> None:
     parser.add_argument("--stage", choices=("repair", "exact", "sentence", "minhash", "all"), default="repair")
     parser.add_argument("--tasks", type=int, default=1)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--language", default="vi")
-    parser.add_argument("--language-backend", choices=("langdetect", "ft176", "glotlid"), default="langdetect")
-    parser.add_argument("--max-repair-fraction", type=float, default=0.30)
+    parser.add_argument(
+        "--dedup-tokenizer-language",
+        default=None,
+        help="Optional DataTrove tokenizer override; defaults to language-neutral Unicode tokenization",
+    )
     parser.add_argument("--keep-image-placeholders", action="store_true")
     parser.add_argument("--skip-long-line-loops", action="store_true")
     args = parser.parse_args()
@@ -43,9 +45,6 @@ def main() -> None:
         glob_pattern=glob_pattern,
         tasks=args.tasks,
         workers=args.workers,
-        language=args.language,
-        language_backend=args.language_backend,
-        repair_max_removed_fraction=args.max_repair_fraction,
         remove_image_placeholders=not args.keep_image_placeholders,
         repair_long_line_loops=not args.skip_long_line_loops,
     )
@@ -62,7 +61,11 @@ def main() -> None:
         print("No documents survived exact deduplication.")
         return
     sentence = build_sentence_dedup_pipeline(
-        root / "exact", root, tasks=args.tasks, workers=args.workers, language=args.language
+        root / "exact",
+        root,
+        tasks=args.tasks,
+        workers=args.workers,
+        tokenizer_language=args.dedup_tokenizer_language,
     )
     sentence.run()
     if args.stage == "sentence":
@@ -71,7 +74,11 @@ def main() -> None:
         print("No documents survived sentence deduplication.")
         return
     minhash = build_minhash_pipeline(
-        root / "sentence", root, tasks=args.tasks, workers=args.workers, language=args.language
+        root / "sentence",
+        root,
+        tasks=args.tasks,
+        workers=args.workers,
+        tokenizer_language=args.dedup_tokenizer_language,
     )
     minhash.run()
     print(f"Final documents: {root / 'minhash'}")

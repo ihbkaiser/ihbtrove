@@ -1,4 +1,4 @@
-"""Composable LocalPipelineExecutor jobs around unmodified DataTrove blocks."""
+"""Composable LocalPipelineExecutor jobs built from DataTrove blocks."""
 
 from pathlib import Path
 import sys
@@ -20,13 +20,12 @@ from datatrove.pipeline.dedup import (
     SentenceDedupSignature,
     SentenceFindDedups,
 )
-from datatrove.pipeline.filters import GopherRepetitionFilter, LanguageFilter
+from datatrove.pipeline.filters import GopherRepetitionFilter
 from datatrove.pipeline.readers import JsonlReader
 from datatrove.pipeline.writers.jsonl import JsonlWriter
 from datatrove.utils.hashing import HashConfig
 
-from .filters import BookQualityFilter, RepairQualityFilter
-from .offline_language import OfflineLanguageFilter
+from .filters import BookQualityFilter
 from .repair import (
     ImagePlaceholderRepair,
     LocalRepeatedSpanRepair,
@@ -35,6 +34,11 @@ from .repair import (
     RepairMetrics,
     UnicodeNormalizer,
 )
+from .tokenization import UnicodeTokenizer
+
+BOOK_GOPHER_FILTER_POLICY_VERSION = "0.3.0"
+BOOK_QUALITY_POLICY_VERSION = "0.2.0"
+DEDUP_TOKENIZER_POLICY_VERSION = "0.1.0"
 
 
 def _writer(path: Path) -> JsonlWriter:
@@ -56,50 +60,38 @@ def build_book_pipeline(
     glob_pattern: str = "*.jsonl",
     tasks: int = 1,
     workers: int = 1,
-    language: str = "vi",
-    language_backend: str = "langdetect",
     page_markers: tuple[str, ...] = ("---",),
     remove_image_placeholders: bool = True,
     repair_long_line_loops: bool = True,
-    repair_max_removed_fraction: float = 0.30,
+    dehyphenate_line_breaks: bool = False,
+    max_consecutive_blank_lines: int | None = 2,
     logging_root: str | Path | None = None,
-    gopher_dup_n_grams: tuple[tuple[int, float], ...] = (
-        (5, 0.20), (6, 0.19), (7, 0.18), (8, 0.17), (9, 0.16), (10, 0.15),
-    ),
 ) -> LocalPipelineExecutor:
-    """Run structural repair before language and traditional text quality gates."""
+    """Run structural repair before permissive, language-neutral quality gates."""
     root = Path(output_root)
     logs = Path(logging_root) if logging_root is not None else root / "logs"
     return LocalPipelineExecutor(
         pipeline=[
             _reader(Path(source), glob_pattern),
-            UnicodeNormalizer(),
+            UnicodeNormalizer(
+                dehyphenate_line_breaks=dehyphenate_line_breaks,
+                max_consecutive_blank_lines=max_consecutive_blank_lines,
+            ),
             *([ImagePlaceholderRepair()] if remove_image_placeholders else []),
             PageStructureRepair(page_markers=page_markers),
             LocalRepeatedSpanRepair(),
             *([LongLineLoopRepair()] if repair_long_line_loops else []),
             RepairMetrics(),
-            RepairQualityFilter(
-                max_removed_fraction=repair_max_removed_fraction,
-                exclusion_writer=_writer(root / "quarantine" / "repair"),
-            ),
-            (
-                OfflineLanguageFilter(
-                    languages=(language,),
-                    language_threshold=0.65,
-                    exclusion_writer=_writer(root / "quarantine" / "language"),
-                )
-                if language_backend == "langdetect"
-                else LanguageFilter(
-                    languages=[language],
-                    language_threshold=0.65,
-                    backend=language_backend,
-                    exclusion_writer=_writer(root / "quarantine" / "language"),
-                )
-            ),
             GopherRepetitionFilter(
-                language=language,
-                dup_n_grams=gopher_dup_n_grams,
+                # Use only language-neutral character checks. Repeated short
+                # headings are not counted, and no locale tokenizer is assumed.
+                dup_line_frac=None,
+                dup_para_frac=None,
+                dup_line_char_frac=0.50,
+                dup_para_char_frac=0.50,
+                top_n_grams=(),
+                dup_n_grams=(),
+                language=None,
                 exclusion_writer=_writer(root / "quarantine" / "repetition"),
             ),
             BookQualityFilter(exclusion_writer=_writer(root / "quarantine" / "book_quality")),
@@ -154,17 +146,18 @@ def build_sentence_dedup_pipeline(
     *,
     tasks: int = 1,
     workers: int = 1,
-    language: str = "vi",
+    tokenizer_language: str | None = None,
     depends: LocalPipelineExecutor | None = None,
     logging_root: str | Path | None = None,
 ) -> LocalPipelineExecutor:
-    """Use DataTrove sentence dedup, preserving short repeated book sections."""
+    """Use DataTrove SentenceDedup with a generic tokenizer by default."""
     root = Path(output_root)
     logs = Path(logging_root) if logging_root is not None else root / "logs"
     config = SentDedupConfig(n_sentences=3, min_words_to_remove_span=25, hash_config=HashConfig(hash_fc="sha1"))
     signatures, duplicates = root / "work" / "sentence" / "signatures", root / "work" / "sentence" / "duplicates"
+    tokenizer = tokenizer_language if tokenizer_language is not None else UnicodeTokenizer()
     signature_job = LocalPipelineExecutor(
-        pipeline=[_reader(Path(source)), SentenceDedupSignature(str(signatures), config=config, language=language)],
+        pipeline=[_reader(Path(source)), SentenceDedupSignature(str(signatures), config=config, language=tokenizer)],
         tasks=tasks,
         workers=workers,
         depends=depends,
@@ -180,7 +173,7 @@ def build_sentence_dedup_pipeline(
     return LocalPipelineExecutor(
         pipeline=[
             _reader(Path(source)),
-            SentenceDedupFilter(str(duplicates), config=config, language=language),
+            SentenceDedupFilter(str(duplicates), config=config, language=tokenizer),
             _writer(root / "sentence"),
         ],
         tasks=tasks,
@@ -196,7 +189,7 @@ def build_minhash_pipeline(
     *,
     tasks: int = 1,
     workers: int = 1,
-    language: str = "vi",
+    tokenizer_language: str | None = None,
     config: MinhashConfig | None = None,
     depends: LocalPipelineExecutor | None = None,
     logging_root: str | Path | None = None,
@@ -207,8 +200,9 @@ def build_minhash_pipeline(
     config = config or MinhashConfig(hash_config=HashConfig(hash_fc="sha1"))
     work = root / "work" / "minhash"
     signatures, pairs, removals = work / "signatures", work / "pairs", work / "removals"
+    tokenizer = tokenizer_language if tokenizer_language is not None else UnicodeTokenizer()
     signature_job = LocalPipelineExecutor(
-        pipeline=[_reader(Path(source)), MinhashDedupSignature(str(signatures), config=config, language=language)],
+        pipeline=[_reader(Path(source)), MinhashDedupSignature(str(signatures), config=config, language=tokenizer)],
         tasks=tasks,
         workers=workers,
         depends=depends,

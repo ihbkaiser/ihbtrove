@@ -11,8 +11,10 @@ absolute paths for `lid.176.bin` and `public_suffix_list.dat`, and a
 present. IHB-Trove added explicit environment overrides and portable fallback
 behavior in `datatrove/utils/lid.py` and
 `datatrove/pipeline/filters/url_filter.py`. It also fixed a `glotlid` backend
-assignment in `datatrove/pipeline/filters/language_filter.py`. These files
-contain additional inline change notices.
+assignment in `datatrove/pipeline/filters/language_filter.py`. The Gopher
+repetition filter also has an optional no-tokenizer path for callers that use
+only language-neutral character checks. These files contain inline change
+notices or comments identifying the IHB-specific changes.
 
 Python bytecode and notebook checkpoints were omitted from the archive import.
 The DataTrove blacklist and tokenizer assets are included. The FastText model

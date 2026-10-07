@@ -5,7 +5,7 @@ from typing import Any
 from datatrove.data import Document
 
 
-REPAIR_VERSION = "0.3.0"
+REPAIR_VERSION = "0.4.0"
 _COUNTERS = (
     "pages_detected",
     "page_boundaries_detected",
@@ -18,6 +18,12 @@ _COUNTERS = (
     "image_notes_removed",
     "long_line_loops_removed",
     "loop_chars_removed",
+    "ligatures_normalized",
+    "soft_hyphens_removed",
+    "soft_hyphen_line_joins",
+    "line_end_hyphens_joined",
+    "trailing_whitespace_removed",
+    "blank_lines_collapsed",
 )
 
 

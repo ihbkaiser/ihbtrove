@@ -19,7 +19,6 @@ dependencies = [
     "fasteners",
     "xxhash<4",
     "rapidfuzz>=3.0",
-    "langdetect>=1.0.9",
     "orjson>=3.0",
     "spacy>=3.8",
     "pyvi>=0.1.1",

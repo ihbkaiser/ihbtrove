@@ -83,7 +83,7 @@ class GopherRepetitionFilter(BaseFilter):
         top_n_grams: tuple[tuple[int, float]] = ((2, 0.2), (3, 0.18), (4, 0.16)),
         dup_n_grams: tuple[tuple[int, float]] = ((5, 0.15), (6, 0.14), (7, 0.13), (8, 0.12), (9, 0.11), (10, 0.10)),
         exclusion_writer: DiskWriter = None,
-        language: str = Languages.english,
+        language: str | None = Languages.english,
     ):
         """
 
@@ -110,34 +110,42 @@ class GopherRepetitionFilter(BaseFilter):
 
     def filter(self, doc: Document) -> bool | tuple[bool, str]:
         text = doc.text
+        text_length = max(1, len(text))
 
         paragraphs = self.paragraph_exp.split(text.strip())
         paragraphs_duplicates, char_duplicates = find_duplicates(paragraphs)
         if self.dup_para_frac and paragraphs_duplicates / len(paragraphs) > self.dup_para_frac:
             return False, "dup_para_frac"
-        if self.dup_para_char_frac and char_duplicates / len(text) > self.dup_para_char_frac:
+        if self.dup_para_char_frac and char_duplicates / text_length > self.dup_para_char_frac:
             return False, "dup_para_char_frac"
 
         lines = self._line_splitter.split(text)
         line_duplicates, char_duplicates = find_duplicates(lines)
         if self.dup_line_frac and line_duplicates / len(lines) > self.dup_line_frac:
             return False, "dup_line_frac"
-        if self.dup_line_char_frac and char_duplicates / len(text) > self.dup_line_char_frac:
+        if self.dup_line_char_frac and char_duplicates / text_length > self.dup_line_char_frac:
             return False, "dup_line_char_frac"
 
-        words = split_into_words(text, self.language)
+        # IHB-Trove uses the language-neutral character checks for mixed-script
+        # corpora and leaves both n-gram tuples empty. Avoid loading a locale
+        # tokenizer in that configuration; stock behavior is unchanged when
+        # either n-gram family is enabled.
+        if self.top_n_grams or self.dup_n_grams:
+            if self.language is None:
+                raise ValueError("Gopher n-gram checks require a configured language tokenizer")
+            words = split_into_words(text, self.language)
 
-        for n, n_frac in self.top_n_grams:
-            n_grams = get_n_grams(words, n)
-            if not n_grams:
-                continue
-            top_char_length = find_top_duplicate(n_grams)
-            if top_char_length / len(text) > n_frac:
-                return False, f"top_{n}_gram"
+            for n, n_frac in self.top_n_grams:
+                n_grams = get_n_grams(words, n)
+                if not n_grams:
+                    continue
+                top_char_length = find_top_duplicate(n_grams)
+                if top_char_length / text_length > n_frac:
+                    return False, f"top_{n}_gram"
 
-        for n, n_frac in self.dup_n_grams:
-            n_duplicates_char = find_all_duplicate(words, n)
-            if n_duplicates_char / len(text) > n_frac:
-                return False, f"duplicated_{n}_n_grams"
+            for n, n_frac in self.dup_n_grams:
+                n_duplicates_char = find_all_duplicate(words, n)
+                if n_duplicates_char / text_length > n_frac:
+                    return False, f"duplicated_{n}_n_grams"
 
         return True

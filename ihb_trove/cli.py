@@ -28,24 +28,32 @@ def main() -> None:
         action="store_true",
         help="Resume from completed stage checkpoints in the existing output folder",
     )
-    parser.add_argument("--language", default="vi")
-    parser.add_argument("--language-backend", choices=("langdetect", "ft176", "glotlid"), default="langdetect")
+    parser.add_argument(
+        "--dedup-tokenizer-language",
+        default=None,
+        help="Optional DataTrove tokenizer override for SentenceDedup/MinHash; default is language-neutral Unicode",
+    )
     parser.add_argument("--page-marker", action="append", dest="page_markers")
-    parser.add_argument("--max-repair-fraction", type=float, default=0.30)
     parser.add_argument("--keep-image-placeholders", action="store_true")
     parser.add_argument("--skip-long-line-loops", action="store_true")
+    parser.add_argument(
+        "--dehyphenate-line-breaks",
+        action="store_true",
+        help="Join visible hyphenated line breaks (opt-in; may alter legitimate words and names)",
+    )
+    parser.add_argument("--max-consecutive-blank-lines", type=int, default=2)
     args = parser.parse_args()
     summary = run_folder_pipeline(
         args.input_folder,
         args.output_folder,
         tasks=args.tasks,
         workers=args.workers,
-        language=args.language,
-        language_backend=args.language_backend,
+        dedup_tokenizer_language=args.dedup_tokenizer_language,
         page_markers=tuple(args.page_markers or ("---",)),
-        max_repair_fraction=args.max_repair_fraction,
         remove_image_placeholders=not args.keep_image_placeholders,
         repair_long_line_loops=not args.skip_long_line_loops,
+        dehyphenate_line_breaks=args.dehyphenate_line_breaks,
+        max_consecutive_blank_lines=args.max_consecutive_blank_lines,
         resume=args.resume,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))

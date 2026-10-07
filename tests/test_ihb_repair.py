@@ -1,8 +1,9 @@
 """Small adversarial fixtures for book/OCR repair and its quality gates."""
 
 from datatrove.data import Document
+from datatrove.pipeline.filters.gopher_repetition_filter import GopherRepetitionFilter
 
-from ihb_trove.filters import BookQualityFilter, RepairQualityFilter
+from ihb_trove.filters import BookQualityFilter
 from ihb_trove.repair import (
     ImagePlaceholderRepair,
     LocalRepeatedSpanRepair,
@@ -11,6 +12,7 @@ from ihb_trove.repair import (
     RepairMetrics,
     UnicodeNormalizer,
 )
+from ihb_trove.tokenization import UnicodeTokenizer
 
 
 def process(text: str, *steps: object) -> Document:
@@ -105,7 +107,26 @@ def test_repeated_short_book_headings_across_pages_are_preserved() -> None:
     assert doc.metadata["repair"]["duplicate_blocks_removed"] == 0
 
 
-def test_metrics_and_quality_gates() -> None:
+def test_gopher_does_not_reject_books_for_repeated_short_headings() -> None:
+    sections = []
+    for index in range(100):
+        body = " ".join(f"thanhphan{index}nguyenlieu{word}" for word in range(24))
+        sections.append(f"Nguyên liệu\n\n{body}")
+    doc = Document(text="\n\n".join(sections), id="recipe-book")
+    language_neutral_gopher = GopherRepetitionFilter(
+        language=None,
+        dup_line_frac=None,
+        dup_para_frac=None,
+        dup_line_char_frac=0.50,
+        dup_para_char_frac=0.50,
+        top_n_grams=(),
+        dup_n_grams=(),
+    )
+    assert language_neutral_gopher.filter(doc) is True
+    assert language_neutral_gopher.filter(Document(text="", id="repaired-empty")) is True
+
+
+def test_metrics_and_permissive_quality_gate() -> None:
     doc = process("Bánh ngọt và chè đậu.\n\n" * 8, UnicodeNormalizer(), LocalRepeatedSpanRepair(), RepairMetrics())
     repair = doc.metadata["repair"]
     for field in ("pages_detected", "headers_removed", "footers_removed", "page_numbers_removed", "boundary_joins", "duplicate_blocks_removed", "chars_before", "chars_after", "removed_fraction", "repair_confidence", "repair_version"):
@@ -113,10 +134,65 @@ def test_metrics_and_quality_gates() -> None:
     assert repair["chars_before"] >= repair["chars_after"]
     assert BookQualityFilter(min_words=8).filter(doc) is True
     doc.metadata["repair"]["removed_fraction"] = 0.8
-    assert RepairQualityFilter().filter(doc) == (False, "excessive_repair")
-    doc.metadata["repair"]["removed_fraction"] = 0.0
     doc.metadata["repair"]["repair_confidence"] = 0.1
-    assert RepairQualityFilter().filter(doc) == (False, "uncertain_repair")
+    assert BookQualityFilter().filter(doc) is True
+
+
+def test_quality_gate_keeps_short_and_mixed_script_documents() -> None:
+    quality = BookQualityFilter()
+    for text in ("短い文。", "مرحبا بالعالم", "Привет мир", "Hello", "नमस्ते दुनिया"):
+        assert quality.filter(Document(text=text, id="multilingual")) is True
+    assert quality.filter(Document(text="  \n", id="empty")) == (False, "empty_text")
+
+
+def test_quality_gate_only_rejects_extreme_repeated_long_lines() -> None:
+    repeated_line = "This long line is repeated by a damaged OCR pass and should be caught. " * 3
+    text = "\n".join([repeated_line] * 8)
+    assert BookQualityFilter().filter(Document(text=text, id="repeated")) == (False, "extreme_repeated_lines")
+
+
+def test_unicode_tokenizer_handles_multiple_scripts_without_locale_setting() -> None:
+    tokenizer = UnicodeTokenizer()
+    assert tokenizer.word_tokenize("Hello, привет 世界こんにちは สวัสดี") == [
+        "Hello", "привет", "世", "界", "こ", "ん", "に", "ち", "は", "ส", "วั", "ส", "ดี"
+    ]
+    assert tokenizer.sent_tokenize("Hello! 你好。Tail without punctuation") == [
+        "Hello!", "你好。", "Tail without punctuation"
+    ]
+
+
+def test_unicode_normalizer_ligatures_soft_hyphens_and_whitespace() -> None:
+    text = "ﬁne ﬂour\ninter\u00ad\nnational\nsoft\u00adhyphen   \n\n\n\nNext line.   "
+    doc = process(text, UnicodeNormalizer(), RepairMetrics())
+    repair = doc.metadata["repair"]
+    assert doc.text == "fine flour\ninternational\nsofthyphen\n\n\nNext line."
+    assert repair["ligatures_normalized"] == 2
+    assert repair["soft_hyphens_removed"] == 2
+    assert repair["soft_hyphen_line_joins"] == 1
+    assert repair["trailing_whitespace_removed"] == 6
+    assert repair["blank_lines_collapsed"] == 1
+
+
+def test_visible_hyphen_line_join_is_opt_in() -> None:
+    text = "inter-\nnational\nBắc-\nNam"
+    unchanged = process(text, UnicodeNormalizer())
+    assert unchanged.text == text
+    repaired = process(text, UnicodeNormalizer(dehyphenate_line_breaks=True))
+    assert repaired.text == "international\nBắcNam"
+    assert repaired.metadata["repair"]["line_end_hyphens_joined"] == 2
+
+
+def test_unicode_normalizer_can_preserve_whitespace_and_ligatures() -> None:
+    text = "ﬁle   \n\n\nparagraph"
+    doc = process(
+        text,
+        UnicodeNormalizer(
+            normalize_ligatures=False,
+            trim_trailing_whitespace=False,
+            max_consecutive_blank_lines=None,
+        ),
+    )
+    assert doc.text == text
 
 
 def test_text_only_image_references_and_generated_note_are_removed() -> None:

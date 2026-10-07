@@ -116,6 +116,13 @@ def test_resume_reuses_completed_stages_and_checks_input_fingerprint(
     checkpoint = output / ".ihb_trove_cache" / "checkpoint.json"
     saved = json.loads(checkpoint.read_text(encoding="utf-8"))
     assert saved["completed_stages"] == ["input_prepared", "book_quality", "exact"]
+    assert saved["config"]["dehyphenate_line_breaks"] is False
+    assert saved["config"]["max_consecutive_blank_lines"] == 2
+    assert saved["config"]["dedup_tokenizer_language"] is None
+    assert saved["config"]["book_gopher_filter_policy_version"] == "0.3.0"
+    assert saved["config"]["book_quality_policy_version"] == "0.2.0"
+    assert saved["config"]["dedup_tokenizer_policy_version"] == "0.1.0"
+    assert saved["config"]["repair_version"] == "0.4.0"
 
     original_input = input_path.read_bytes()
     input_path.write_text(json.dumps({"id": "changed", "text": "Changed content."}) + "\n", encoding="utf-8")
