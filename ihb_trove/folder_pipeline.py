@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -28,6 +28,7 @@ from .pipelines import (
     build_exact_dedup_pipeline,
     build_minhash_pipeline,
     build_sentence_dedup_pipeline,
+    resolve_dedup_finder_workers,
 )
 from .repair._common import REPAIR_VERSION
 
@@ -39,6 +40,37 @@ _PREP_WORKER_LIMIT = 16
 _CACHE_SCHEMA_VERSION = 1
 _CACHE_DIRECTORY = ".ihb_trove_cache"
 _STAGES = ("input_prepared", "book_quality", "exact", "sentence", "minhash", "routed")
+InputFolders = str | Path | Sequence[str | Path]
+
+
+def _normalize_input_folders(input_folders: InputFolders) -> tuple[list[Path], list[str]]:
+    """Resolve and validate one or more input roots, assigning unique output labels."""
+    if isinstance(input_folders, (str, Path)):
+        values = [input_folders]
+    else:
+        values = list(input_folders)
+    if not values:
+        raise ValueError("At least one input folder is required")
+
+    roots = [Path(value).expanduser().resolve() for value in values]
+    for root in roots:
+        if not root.is_dir():
+            raise ValueError(f"Input folder does not exist or is not a directory: {root}")
+    for index, first in enumerate(roots):
+        for second in roots[index + 1 :]:
+            if first == second or first in second.parents or second in first.parents:
+                raise ValueError(f"Input folders overlap: {first} and {second}")
+
+    labels: list[str] = []
+    for index, root in enumerate(roots, start=1):
+        base_label = root.name or f"input_{index}"
+        label = base_label
+        suffix = 2
+        while label in labels:
+            label = f"{base_label}_{suffix}"
+            suffix += 1
+        labels.append(label)
+    return roots, labels
 
 
 def _info(run_log: logging.Logger, message: str, *args: Any) -> None:
@@ -203,7 +235,7 @@ def _resolve_parallelism(file_count: int, tasks: int | None, workers: int | None
 
 
 def _prepare_one_file(
-    input_root: Path,
+    source_file: Path,
     staged: Path,
     invalid_root: Path,
     relative_name: str,
@@ -216,7 +248,7 @@ def _prepare_one_file(
     digest = hashlib.sha256()
     invalid_handle: BinaryIO | None = None
     try:
-        with (input_root / relative).open("rb") as src, destination.open("wb") as dst:
+        with source_file.open("rb") as src, destination.open("wb") as dst:
             for line_number, line in enumerate(src, start=1):
                 digest.update(line)
                 if not line.strip():
@@ -346,21 +378,20 @@ class _OutputRouter:
 
 
 def _prepare_input(
-    input_root: Path,
+    source_files: dict[str, Path],
     staged: Path,
     invalid_root: Path,
-    relative_names: list[str],
     preparation_workers: int,
     run_log: logging.Logger,
 ) -> tuple[int, int, dict[str, str]]:
     total = valid = 0
-    names = sorted(relative_names)
+    names = sorted(source_files)
     fingerprints: dict[str, str] = {}
     processed_files = 0
     pool_size = min(preparation_workers, len(names))
     with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="ihb-jsonl") as pool:
         futures = {
-            pool.submit(_prepare_one_file, input_root, staged, invalid_root, relative_name): relative_name
+            pool.submit(_prepare_one_file, source_files[relative_name], staged, invalid_root, relative_name): relative_name
             for relative_name in names
         }
         with tqdm(
@@ -390,17 +421,16 @@ def _prepare_input(
     return total, valid, fingerprints
 
 
-def _hash_one_file(input_root: Path, relative_name: str) -> tuple[str, str]:
+def _hash_one_file(source_file: Path, relative_name: str) -> tuple[str, str]:
     digest = hashlib.sha256()
-    with (input_root / relative_name).open("rb") as handle:
+    with source_file.open("rb") as handle:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return relative_name, digest.hexdigest()
 
 
 def _verify_input_fingerprint(
-    input_root: Path,
-    relative_names: list[str],
+    source_files: dict[str, Path],
     expected: str,
     workers: int,
     run_log: logging.Logger,
@@ -408,9 +438,10 @@ def _verify_input_fingerprint(
     _info(run_log, "Verifying input fingerprint before reusing cached stages")
     fingerprints: dict[str, str] = {}
     processed_files = 0
+    relative_names = sorted(source_files)
     pool_size = min(max(1, workers), len(relative_names))
     with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="ihb-hash") as pool:
-        futures = [pool.submit(_hash_one_file, input_root, name) for name in relative_names]
+        futures = [pool.submit(_hash_one_file, source_files[name], name) for name in relative_names]
         with tqdm(
             total=len(futures),
             desc="Verify input files",
@@ -462,11 +493,12 @@ def _route_dropped(
 
 
 def run_folder_pipeline(
-    input_folder: str | Path,
+    input_folder: InputFolders,
     output_folder: str | Path,
     *,
     tasks: int | None = None,
     workers: int | None = None,
+    dedup_finder_workers: int | None = None,
     dedup_tokenizer_language: str | None = None,
     page_markers: tuple[str, ...] = ("---",),
     remove_image_placeholders: bool = True,
@@ -482,15 +514,17 @@ def run_folder_pipeline(
     Completed stages are checkpointed under ``output/.ihb_trove_cache``. Pass
     ``resume=True`` after interruption to reuse completed stages safely.
     """
-    source, output = Path(input_folder).resolve(), Path(output_folder).resolve()
-    if not source.is_dir():
-        raise ValueError("input_folder must be a directory")
+    sources, source_labels = _normalize_input_folders(input_folder)
+    output = Path(output_folder).expanduser().resolve()
     if (tasks is not None and tasks < 1) or (workers is not None and workers < 1):
         raise ValueError("tasks/workers must be positive when specified")
+    if dedup_finder_workers is not None and dedup_finder_workers < 1:
+        raise ValueError("dedup_finder_workers must be positive when specified")
     if max_consecutive_blank_lines is not None and max_consecutive_blank_lines < 0:
         raise ValueError("max_consecutive_blank_lines must be nonnegative or None")
-    if source == output or source in output.parents or output in source.parents:
-        raise ValueError("input and output directories must not overlap")
+    for source in sources:
+        if source == output or source in output.parents or output in source.parents:
+            raise ValueError(f"Input and output directories must not overlap: {source} and {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     with _output_lock(output):
         cache_root = output / _CACHE_DIRECTORY
@@ -502,7 +536,11 @@ def run_folder_pipeline(
                 state["resume_count"] = int(state.get("resume_count", 0)) + 1
                 _save_checkpoint(cache_root, state)
             elif resume and summary_path.is_file():
-                return json.loads(summary_path.read_text(encoding="utf-8"))
+                saved_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                saved_inputs = saved_summary.get("input_folders")
+                if saved_inputs is not None and saved_inputs != [str(source) for source in sources]:
+                    raise ValueError("Input folder list differs from the completed run")
+                return saved_summary
             elif resume:
                 raise ValueError(
                     f"No IHB-Trove checkpoint found under {output}. This output came from a run "
@@ -538,16 +576,21 @@ def run_folder_pipeline(
         run_log.addHandler(file_handler)
         started = time.perf_counter()
         _info(run_log, "IHB-Trove run started resume={}", resume)
-        _info(run_log, "Input folder: {}", source)
+        _info(
+            run_log,
+            "Input folders: {}",
+            ", ".join(f"{label}={source}" for source, label in zip(sources, source_labels, strict=True)),
+        )
         _info(run_log, "Output folder: {}", output)
         _info(run_log, "Detailed live log: {}", log_path)
         _info(
             run_log,
-            "Requested options: tasks={} workers={} dedup_tokenizer_language={} page_markers={} "
+            "Requested options: tasks={} workers={} dedup_finder_workers={} dedup_tokenizer_language={} page_markers={} "
             "remove_image_placeholders={} repair_long_line_loops={} "
             "dehyphenate_line_breaks={} max_consecutive_blank_lines={}",
             tasks,
             workers,
+            dedup_finder_workers,
             dedup_tokenizer_language,
             page_markers,
             remove_image_placeholders,
@@ -557,7 +600,8 @@ def run_folder_pipeline(
         )
         try:
             return _run_folder_pipeline_impl(
-                source,
+                sources,
+                source_labels,
                 output,
                 log_path,
                 cache_root,
@@ -565,6 +609,7 @@ def run_folder_pipeline(
                 run_log=run_log,
                 tasks=tasks,
                 workers=workers,
+                dedup_finder_workers=dedup_finder_workers,
                 dedup_tokenizer_language=dedup_tokenizer_language,
                 page_markers=page_markers,
                 remove_image_placeholders=remove_image_placeholders,
@@ -586,7 +631,8 @@ def run_folder_pipeline(
 
 
 def _run_folder_pipeline_impl(
-    source: Path,
+    sources: list[Path],
+    source_labels: list[str],
     output: Path,
     log_path: Path,
     cache_root: Path,
@@ -595,6 +641,7 @@ def _run_folder_pipeline_impl(
     run_log: logging.Logger,
     tasks: int | None,
     workers: int | None,
+    dedup_finder_workers: int | None,
     dedup_tokenizer_language: str | None,
     page_markers: tuple[str, ...],
     remove_image_placeholders: bool,
@@ -602,41 +649,53 @@ def _run_folder_pipeline_impl(
     dehyphenate_line_breaks: bool,
     max_consecutive_blank_lines: int | None,
 ) -> dict[str, Any]:
-    _info(run_log, "Scanning recursively for JSONL files")
+    _info(run_log, "Scanning {} input folder(s) recursively for JSONL files", len(sources))
     discovery_started = time.perf_counter()
-    paths: list[Path] = []
+    source_files: dict[str, Path] = {}
     with tqdm(desc="Discover JSONL", unit="file", mininterval=1.0, disable=None) as bar:
-        for path in source.rglob("*.jsonl"):
-            if path.is_file():
-                paths.append(path.relative_to(source))
-            bar.update(1)
-            if bar.n and bar.n % 10_000 == 0:
-                _info(run_log, "Discovery progress: {} JSONL paths scanned", bar.n)
-    paths.sort()
+        for source, label in zip(sources, source_labels, strict=True):
+            for path in source.rglob("*.jsonl"):
+                if path.is_file():
+                    relative = path.relative_to(source)
+                    if len(sources) > 1:
+                        relative = Path(label) / relative
+                    source_files[relative.as_posix()] = path
+                bar.update(1)
+                if bar.n and bar.n % 10_000 == 0:
+                    _info(run_log, "Discovery progress: {} JSONL paths scanned", bar.n)
+    source_files = dict(sorted(source_files.items()))
     _info(
         run_log,
         "JSONL discovery complete: files={} elapsed_seconds={:.2f}",
-        len(paths),
+        len(source_files),
         time.perf_counter() - discovery_started,
     )
-    if not paths:
-        raise ValueError(f"No JSONL files under {source}")
+    if not source_files:
+        raise ValueError(f"No JSONL files under input folder(s): {', '.join(map(str, sources))}")
     available_cpus = _available_cpu_count()
     saved_config = state.get("config")
     if saved_config:
         saved_tasks = int(saved_config["tasks"])
         saved_workers = int(saved_config["workers"])
-        if tasks is not None and min(tasks, len(paths)) != saved_tasks:
+        if tasks is not None and min(tasks, len(source_files)) != saved_tasks:
             raise ValueError("--tasks differs from the checkpoint; resume with the original task count")
         if workers is not None and min(workers, saved_tasks) != saved_workers:
             raise ValueError("--workers differs from the checkpoint; resume with the original worker count")
         tasks, workers = saved_tasks, saved_workers
     else:
-        tasks, workers = _resolve_parallelism(len(paths), tasks, workers)
-    preparation_workers = min(_PREP_WORKER_LIMIT, workers, len(paths))
+        tasks, workers = _resolve_parallelism(len(source_files), tasks, workers)
+    saved_finder_workers = (
+        int(saved_config.get("dedup_finder_workers", 1)) if saved_config is not None else None
+    )
+    finder_workers_request = (
+        dedup_finder_workers if dedup_finder_workers is not None else saved_finder_workers
+    )
+    dedup_finder_workers = resolve_dedup_finder_workers(tasks, workers, finder_workers_request)
+    preparation_workers = min(_PREP_WORKER_LIMIT, workers, len(source_files))
     config = {
         "tasks": tasks,
         "workers": workers,
+        "dedup_finder_workers": dedup_finder_workers,
         "dedup_tokenizer_language": dedup_tokenizer_language,
         "page_markers": list(page_markers),
         "remove_image_placeholders": remove_image_placeholders,
@@ -648,44 +707,64 @@ def _run_folder_pipeline_impl(
         "dedup_tokenizer_policy_version": DEDUP_TOKENIZER_POLICY_VERSION,
         "repair_version": REPAIR_VERSION,
     }
-    saved_source = state.get("source_root")
-    if saved_source is not None and saved_source != str(source):
-        raise ValueError("Input folder differs from the checkpoint")
+    # Older checkpoints used DataTrove's single-worker finder. Keep that exact
+    # executor layout when resuming them; new runs record the optimized setting.
+    if saved_config is not None and "dedup_finder_workers" not in saved_config and dedup_finder_workers == 1:
+        config.pop("dedup_finder_workers")
+    if len(sources) == 1:
+        saved_source = state.get("source_root")
+        if saved_source is not None and saved_source != str(sources[0]):
+            raise ValueError("Input folder differs from the checkpoint")
+        if state.get("source_roots") is not None:
+            raise ValueError("Input folder list differs from the checkpoint")
+        state["source_root"] = str(sources[0])
+        state.pop("source_roots", None)
+    else:
+        source_spec = [
+            {"path": str(source), "label": label}
+            for source, label in zip(sources, source_labels, strict=True)
+        ]
+        if state.get("source_root") is not None or (
+            state.get("source_roots") is not None and state["source_roots"] != source_spec
+        ):
+            raise ValueError("Input folder list differs from the checkpoint")
+        state["source_roots"] = source_spec
+        state.pop("source_root", None)
     if saved_config is not None and saved_config != config:
         raise ValueError("Pipeline options differ from the checkpoint; resume with the original options")
-    state["source_root"] = str(source)
-    state["input_file_count"] = len(paths)
+    state["input_file_count"] = len(source_files)
     state["config"] = config
     _save_checkpoint(cache_root, state)
     _info(
         run_log,
-        "Parallelism selected: files={} available_cpus={} tasks={} workers={} preparation_workers={}",
-        len(paths),
+        "Parallelism selected: files={} available_cpus={} tasks={} workers={} dedup_finder_workers={} preparation_workers={}",
+        len(source_files),
         available_cpus,
         tasks,
         workers,
+        dedup_finder_workers,
         preparation_workers,
     )
     summary: dict[str, Any] = {
-        "input_files": len(paths),
+        "input_files": len(source_files),
+        "input_folders": [str(source) for source in sources],
         "log_file": str(log_path),
         "parallelism": {
             "tasks": tasks,
             "workers": workers,
+            "dedup_finder_workers": dedup_finder_workers,
             "preparation_workers": preparation_workers,
         },
         "stages": {},
         "resumed_from_checkpoint": int(state.get("resume_count", 0)) > 0,
     }
     stats = state.setdefault("stats", {})
-    relative_names = [path.as_posix() for path in paths]
     input_staged, invalid_root, stages = cache_root / "input", cache_root / "invalid_input", cache_root / "stages"
 
     if "input_prepared" in state["completed_stages"]:
         total, valid = int(stats["input_records"]), int(stats["validated_records"])
         _verify_input_fingerprint(
-            source,
-            relative_names,
+            source_files,
             str(state["input_fingerprint"]),
             preparation_workers,
             run_log,
@@ -695,10 +774,9 @@ def _run_folder_pipeline_impl(
         _clear_path(invalid_root)
         with _timed_stage(run_log, "input validation and parallel staging"):
             total, valid, fingerprints = _prepare_input(
-                source,
+                source_files,
                 input_staged,
                 invalid_root,
-                relative_names,
                 preparation_workers,
                 run_log,
             )
@@ -752,6 +830,8 @@ def _run_folder_pipeline_impl(
                 kwargs: dict[str, Any] = {"tasks": tasks, "workers": workers}
                 if name != "exact":
                     kwargs["tokenizer_language"] = dedup_tokenizer_language
+                if name in {"exact", "sentence"}:
+                    kwargs["finder_workers"] = dedup_finder_workers
                 kwargs["logging_root"] = output / "logs" / "datatrove"
                 with _timed_stage(run_log, f"{name} dedup"):
                     builder(previous, stages, **kwargs).run()
@@ -777,7 +857,7 @@ def _run_folder_pipeline_impl(
 
     _clear_path(output / "survive")
     _clear_path(output / "eliminated")
-    router = _OutputRouter(output, paths, run_log)
+    router = _OutputRouter(output, [Path(name) for name in source_files], run_log)
     try:
         with _timed_stage(run_log, "route all exclusions and survivors"):
             for record in _records(invalid_root, progress="Route invalid input", run_log=run_log):

@@ -39,6 +39,21 @@ from .tokenization import UnicodeTokenizer
 BOOK_GOPHER_FILTER_POLICY_VERSION = "0.3.0"
 BOOK_QUALITY_POLICY_VERSION = "0.2.0"
 DEDUP_TOKENIZER_POLICY_VERSION = "0.1.0"
+_DEFAULT_DEDUP_FINDER_WORKERS = 16
+
+
+def resolve_dedup_finder_workers(
+    tasks: int,
+    workers: int,
+    requested: int | None = None,
+) -> int:
+    """Choose hash-range finder shards without exceeding available executor parallelism."""
+    if tasks < 1 or workers < 1:
+        raise ValueError("tasks and workers must be positive")
+    target = _DEFAULT_DEDUP_FINDER_WORKERS if requested is None else requested
+    if target < 1:
+        raise ValueError("dedup_finder_workers must be positive")
+    return min(target, tasks, workers)
 
 
 def _writer(path: Path) -> JsonlWriter:
@@ -109,16 +124,21 @@ def build_exact_dedup_pipeline(
     *,
     tasks: int = 1,
     workers: int = 1,
+    finder_workers: int | None = None,
     depends: LocalPipelineExecutor | None = None,
     logging_root: str | Path | None = None,
 ) -> LocalPipelineExecutor:
     """Signature → global exact matching → filter, with stable reader sharding."""
     root = Path(output_root)
     logs = Path(logging_root) if logging_root is not None else root / "logs"
+    finder_workers = resolve_dedup_finder_workers(tasks, workers, finder_workers)
     config = ExactDedupConfig(content_getter=_exact_text, hash_config=HashConfig(hash_fc="sha1"))
     signatures, duplicates = root / "work" / "exact" / "signatures", root / "work" / "exact" / "duplicates"
     signature_job = LocalPipelineExecutor(
-        pipeline=[_reader(Path(source)), ExactDedupSignature(str(signatures), config)],
+        pipeline=[
+            _reader(Path(source)),
+            ExactDedupSignature(str(signatures), config, finder_workers=finder_workers),
+        ],
         tasks=tasks,
         workers=workers,
         depends=depends,
@@ -126,8 +146,8 @@ def build_exact_dedup_pipeline(
     )
     find_job = LocalPipelineExecutor(
         pipeline=[ExactFindDedups(str(signatures), str(duplicates), config)],
-        tasks=1,
-        workers=1,
+        tasks=finder_workers,
+        workers=min(workers, finder_workers),
         depends=signature_job,
         logging_dir=str(logs / "exact_find"),
     )
@@ -146,6 +166,7 @@ def build_sentence_dedup_pipeline(
     *,
     tasks: int = 1,
     workers: int = 1,
+    finder_workers: int | None = None,
     tokenizer_language: str | None = None,
     depends: LocalPipelineExecutor | None = None,
     logging_root: str | Path | None = None,
@@ -153,11 +174,17 @@ def build_sentence_dedup_pipeline(
     """Use DataTrove SentenceDedup with a generic tokenizer by default."""
     root = Path(output_root)
     logs = Path(logging_root) if logging_root is not None else root / "logs"
+    finder_workers = resolve_dedup_finder_workers(tasks, workers, finder_workers)
     config = SentDedupConfig(n_sentences=3, min_words_to_remove_span=25, hash_config=HashConfig(hash_fc="sha1"))
     signatures, duplicates = root / "work" / "sentence" / "signatures", root / "work" / "sentence" / "duplicates"
     tokenizer = tokenizer_language if tokenizer_language is not None else UnicodeTokenizer()
     signature_job = LocalPipelineExecutor(
-        pipeline=[_reader(Path(source)), SentenceDedupSignature(str(signatures), config=config, language=tokenizer)],
+        pipeline=[
+            _reader(Path(source)),
+            SentenceDedupSignature(
+                str(signatures), config=config, language=tokenizer, finder_workers=finder_workers
+            ),
+        ],
         tasks=tasks,
         workers=workers,
         depends=depends,
@@ -165,8 +192,8 @@ def build_sentence_dedup_pipeline(
     )
     find_job = LocalPipelineExecutor(
         pipeline=[SentenceFindDedups(str(signatures), str(duplicates), config=config)],
-        tasks=1,
-        workers=1,
+        tasks=finder_workers,
+        workers=min(workers, finder_workers),
         depends=signature_job,
         logging_dir=str(logs / "sentence_find"),
     )

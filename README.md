@@ -28,6 +28,18 @@ python -m venv .venv
 .venv/bin/ihb-trove /path/to/input_jsonl_folder /path/to/new_output_folder
 ```
 
+Pass multiple input folders before the output folder to process their JSONL files in one shared pipeline and deduplicate across all of them:
+
+```bash
+.venv/bin/ihb-trove /path/to/raw-book /path/to/raw-giaoduc /path/to/new_output_folder
+```
+
+For long folder lists, `--input-folders-file` reads one folder path per line. Blank lines and lines beginning with `#` are ignored; relative paths are resolved against the list file's directory:
+
+```bash
+.venv/bin/ihb-trove /path/to/new_output_folder --input-folders-file /path/to/input_folders.txt
+```
+
 If a run is interrupted, resume it with the same input, output, and pipeline options:
 
 ```bash
@@ -36,7 +48,7 @@ If a run is interrupted, resume it with the same input, output, and pipeline opt
 
 The runner checkpoints completed stages under `OUTPUT/.ihb_trove_cache/`. The cache is retained after interruption and removed after a successful run. A resumed run reuses completed stages and reruns only the unfinished stage; if interrupted during final routing, it rebuilds `survive/` and `eliminated/` from cached stage outputs. Input content and pipeline options must match the checkpoint. Resume re-reads the input to verify its content fingerprint. Legacy interrupted runs that only have an `ihb-trove-*` temporary directory cannot be resumed by this feature.
 
-By default, the CLI detects the available CPU quota, uses up to 32 workers and creates up to four DataTrove shards per worker, capped by the number of JSONL files. Task count is always capped by the file count because this runner shards its reader by file. Input validation/staging reads up to 16 files concurrently. Pass `--tasks` and `--workers` to override these defaults. Set `--workers 1` for a serial baseline. Progress bars report staged files, DataTrove reader file shards, and records being routed; bars are disabled automatically when output is not an interactive terminal.
+By default, the CLI detects the available CPU quota, uses up to 32 workers and creates up to four DataTrove shards per worker, capped by the number of JSONL files. Task count is always capped by the file count because this runner shards its reader by file. Input validation/staging reads up to 16 files concurrently. ExactDedup and SentenceDedup use up to 16 hash-range finder workers by default; set `--dedup-finder-workers` to tune that phase. Pass `--tasks` and `--workers` to override the main executor defaults. Set `--workers 1` for a serial baseline. Progress bars report staged files, DataTrove reader file shards, and records being routed; bars are disabled automatically when output is not an interactive terminal.
 
 The run writes a live orchestration log to `OUTPUT/logs/run.log`; DataTrove executor/task logs remain under `OUTPUT/logs/datatrove/` after completion. Follow the live log in another terminal with:
 
@@ -50,7 +62,7 @@ To confirm both import names resolve to this checkout:
 .venv/bin/python -c "import datatrove, ihb_trove; print(datatrove.__file__, ihb_trove.__file__)"
 ```
 
-The script scans `*.jsonl` **recursively**, processes all documents together for global deduplication, and mirrors each input file's relative path under both outputs. Each source has a corresponding JSONL file in each output, possibly empty. Every input record goes to exactly one side. Invalid JSON and records without text go to `eliminated/` with a reason; filtering and whole-document dedup removals also go there. SentenceDedup edits a surviving document's text without routing its original copy to `eliminated/`.
+The script scans `*.jsonl` **recursively** under every input folder, processes all documents together for global deduplication, and mirrors each input file's relative path under both outputs. With multiple input folders, each path is prefixed by its source folder name to prevent collisions. Each source has a corresponding JSONL file in each output, possibly empty. Every input record goes to exactly one side. Invalid JSON and records without text go to `eliminated/` with a reason; filtering and whole-document dedup removals also go there. SentenceDedup edits a surviving document's text without routing its original copy to `eliminated/`.
 
 ```text
 input_jsonl_folder/
@@ -80,6 +92,12 @@ Every eliminated record carries `metadata.filter_reason` and `metadata.ihb_exclu
 
 # Optional: use a DataTrove locale tokenizer for SentenceDedup/MinHash instead of UnicodeTokenizer:
 .venv/bin/ihb-trove INPUT OUTPUT --dedup-tokenizer-language en
+```
+
+For a large corpus, the ExactDedup and SentenceDedup hash-finder phases can run in parallel. The default is `min(16, tasks, workers)`; raise it cautiously because each hash partition creates intermediate signature files:
+
+```bash
+.venv/bin/ihb-trove INPUT OUTPUT --tasks 448 --workers 112 --dedup-finder-workers 16
 ```
 
 There is no language filter and no maximum repair-fraction gate: `RepairMetrics` records the edit counts and confidence for review, while the repaired document continues through the pipeline. Markdown/HTML image references and generated unavailable-image notes are removed by default. `--skip-long-line-loops` disables the conservative exact OCR word-loop repair. The Unicode normalization step expands common presentation ligatures, removes soft hyphens, trims line-end spaces, and caps blank-line runs at two; use `--max-consecutive-blank-lines` to change the cap. Visible-hyphen line joining is opt-in because it can alter legitimate words and names.

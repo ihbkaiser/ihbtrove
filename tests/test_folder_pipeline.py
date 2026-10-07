@@ -1,10 +1,12 @@
 """End-to-end routing across recursive sources and global exact dedup."""
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
+import ihb_trove.cli as cli
 import ihb_trove.folder_pipeline as folder_pipeline
 from ihb_trove.folder_pipeline import run_folder_pipeline
 
@@ -52,6 +54,94 @@ def test_recursive_mirror_invalid_records_and_global_duplicate(tmp_path: Path) -
     assert "Run summary:" in run_log
     assert "IHB-Trove run finished" in run_log
     assert list((output / "logs" / "datatrove").rglob("task_*.log"))
+
+
+def test_cli_accepts_multiple_input_folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    first = tmp_path / "raw-book"
+    second = tmp_path / "raw-giaoduc"
+    output = tmp_path / "processed"
+    captured: dict[str, object] = {}
+
+    def fake_run(inputs: object, destination: object, **kwargs: object) -> dict[str, object]:
+        captured.update(inputs=inputs, output=destination, kwargs=kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "run_folder_pipeline", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ihb-trove",
+            str(first),
+            str(second),
+            str(output),
+            "--tasks",
+            "2",
+            "--workers",
+            "1",
+            "--dedup-finder-workers",
+            "1",
+        ],
+    )
+    cli.main()
+    capsys.readouterr()
+
+    assert captured["inputs"] == [first, second]
+    assert captured["output"] == output
+    assert captured["kwargs"]["dedup_finder_workers"] == 1
+
+
+def test_cli_reads_folder_paths_from_list_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    first = tmp_path / "raw-book"
+    second = tmp_path / "raw-giaoduc"
+    listing = tmp_path / "folders.txt"
+    listing.write_text("# source folders\nraw-book\n\nraw-giaoduc\n", encoding="utf-8")
+    output = tmp_path / "processed"
+    captured: dict[str, object] = {}
+
+    def fake_run(inputs: object, destination: object, **kwargs: object) -> dict[str, object]:
+        captured.update(inputs=inputs, output=destination, kwargs=kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "run_folder_pipeline", fake_run)
+    monkeypatch.setattr(sys, "argv", ["ihb-trove", str(output), "--input-folders-file", str(listing)])
+    cli.main()
+    capsys.readouterr()
+
+    assert captured["inputs"] == [first, second]
+    assert captured["output"] == output
+
+
+def test_multiple_input_folders_preserve_names_and_deduplicate_globally(tmp_path: Path) -> None:
+    book_root = tmp_path / "raw-book"
+    education_root = tmp_path / "raw-giaoduc"
+    output = tmp_path / "output"
+    book_root.mkdir()
+    education_root.mkdir()
+    text = "\n".join(
+        f"Writer prepares ingredient{index} with water{index}, mixes carefully{index}, "
+        f"then cooks until texture{index} changes and serves the finished dish{index}."
+        for index in range(60)
+    )
+    record = {"id": "same-book", "text": text}
+    for root in (book_root, education_root):
+        (root / "volume.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    summary = run_folder_pipeline([book_root, education_root], output, tasks=2, workers=2)
+
+    assert summary["input_files"] == 2
+    assert summary["input_folders"] == [str(book_root.resolve()), str(education_root.resolve())]
+    assert summary["stages"]["exact"] == 1
+    for relative in ("raw-book/volume.jsonl", "raw-giaoduc/volume.jsonl"):
+        assert (output / "survive" / relative).is_file()
+        assert (output / "eliminated" / relative).is_file()
+    routed = [
+        row
+        for category in ("survive", "eliminated")
+        for path in (output / category).rglob("*.jsonl")
+        for row in _read(path)
+    ]
+    assert len(routed) == 2
 
 
 def test_resume_reuses_completed_stages_and_checks_input_fingerprint(
@@ -119,10 +209,16 @@ def test_resume_reuses_completed_stages_and_checks_input_fingerprint(
     assert saved["config"]["dehyphenate_line_breaks"] is False
     assert saved["config"]["max_consecutive_blank_lines"] == 2
     assert saved["config"]["dedup_tokenizer_language"] is None
+    assert saved["config"]["dedup_finder_workers"] == 1
     assert saved["config"]["book_gopher_filter_policy_version"] == "0.3.0"
     assert saved["config"]["book_quality_policy_version"] == "0.2.0"
     assert saved["config"]["dedup_tokenizer_policy_version"] == "0.1.0"
     assert saved["config"]["repair_version"] == "0.4.0"
+
+    # A checkpoint from before the finder tuning had no finder worker option.
+    # It must continue with the original single-worker layout when resumed.
+    saved["config"].pop("dedup_finder_workers")
+    checkpoint.write_text(json.dumps(saved), encoding="utf-8")
 
     original_input = input_path.read_bytes()
     input_path.write_text(json.dumps({"id": "changed", "text": "Changed content."}) + "\n", encoding="utf-8")
